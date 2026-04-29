@@ -18,31 +18,96 @@ class ArticleListLoader
         AuthHelper $authHelper
     ): array {
         $result = $authHelper->processUnguarded(function () use ($itemRepository) {
-            return $itemRepository->search(['*'], ['de'], 1, 10);
+            return $itemRepository->search([], [], 1, 10);
         });
 
+        $entries = $result->getResult();
+
         $articles = [];
-        foreach ($result->getResult() as $item) {
-            if (!is_array($item)) {
+        foreach ($entries as $item) {
+            $id = self::idOf($item);
+            if ($id === null) {
                 continue;
             }
             $articles[] = [
-                'id'   => $item['id'] ?? null,
-                'name' => self::extractName($item),
+                'id'   => $id,
+                'name' => self::nameOf($item) ?? '(kein Name)',
             ];
         }
         return $articles;
     }
 
-    private static function extractName(array $item): string
+    /**
+     * Debug-Variante: gibt das rohe Resultat in einer
+     * sandbox-konformen Form zurück, damit Plenty-Datenstruktur
+     * sichtbar wird, wenn die Liste leer bleibt.
+     */
+    public static function debug(
+        ItemRepositoryContract $itemRepository,
+        AuthHelper $authHelper
+    ): array {
+        $result = $authHelper->processUnguarded(function () use ($itemRepository) {
+            return $itemRepository->search([], [], 1, 10);
+        });
+
+        $entries = $result->getResult();
+
+        $info = [
+            'result_class'    => is_object($result) ? get_class($result) : gettype($result),
+            'entries_type'    => is_array($entries) ? 'array' : (is_object($entries) ? get_class($entries) : gettype($entries)),
+            'entries_count'   => is_array($entries) ? count($entries) : null,
+            'first_item_type' => null,
+            'first_item_keys' => null,
+            'first_item_json' => null,
+        ];
+
+        if (is_array($entries) && !empty($entries)) {
+            $first = reset($entries);
+            $info['first_item_type'] = is_array($first) ? 'array' : (is_object($first) ? get_class($first) : gettype($first));
+            if (is_array($first)) {
+                $info['first_item_keys'] = array_keys($first);
+            }
+            $info['first_item_json'] = json_encode($first);
+        }
+
+        return $info;
+    }
+
+    private static function idOf($item)
     {
-        if (!empty($item['texts']) && is_array($item['texts'])) {
-            foreach ($item['texts'] as $text) {
-                if (is_array($text) && !empty($text['name1'])) {
-                    return $text['name1'];
-                }
+        if (is_array($item)) {
+            return $item['id'] ?? null;
+        }
+        if (is_object($item) && isset($item->id)) {
+            return $item->id;
+        }
+        return null;
+    }
+
+    private static function nameOf($item)
+    {
+        $texts = null;
+        if (is_array($item)) {
+            $texts = $item['texts'] ?? null;
+        } elseif (is_object($item) && isset($item->texts)) {
+            $texts = $item->texts;
+        }
+
+        if ($texts === null) {
+            return null;
+        }
+        if (!is_array($texts) && !is_object($texts)) {
+            return null;
+        }
+
+        foreach ($texts as $text) {
+            if (is_array($text) && !empty($text['name1'])) {
+                return $text['name1'];
+            }
+            if (is_object($text) && isset($text->name1) && $text->name1 !== '') {
+                return $text->name1;
             }
         }
-        return '(kein Name)';
+        return null;
     }
 }
