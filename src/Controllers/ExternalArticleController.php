@@ -53,12 +53,13 @@ class ExternalArticleController extends Controller
             return $itemRepository->search([], [$lang], $page, $perPage, ['texts']);
         });
 
-        $entries     = $paginated->getResult();
-        $entriesArr  = is_array($entries) ? $entries : [];
+        $entries = $paginated->getResult();
 
         $articles = [];
-        foreach ($entriesArr as $item) {
-            $articles[] = self::serializeArticle($item, $lang);
+        if (is_array($entries) || is_object($entries)) {
+            foreach ($entries as $item) {
+                $articles[] = self::serializeArticle($item, $lang);
+            }
         }
 
         // --- Pagination-Metadaten via toArray() (laut Plenty-Doku verfügbar) -
