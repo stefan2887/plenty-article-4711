@@ -53,8 +53,8 @@ class ArticleListLoader
         $entries = $result->getResult();
 
         $info = [
-            'result_class'    => is_object($result) ? get_class($result) : gettype($result),
-            'entries_type'    => is_array($entries) ? 'array' : (is_object($entries) ? get_class($entries) : gettype($entries)),
+            'result_class'    => self::typeOf($result),
+            'entries_type'    => self::typeOf($entries),
             'entries_count'   => is_array($entries) ? count($entries) : null,
             'first_item_type' => null,
             'first_item_keys' => null,
@@ -63,7 +63,7 @@ class ArticleListLoader
 
         if (is_array($entries) && !empty($entries)) {
             $first = reset($entries);
-            $info['first_item_type'] = is_array($first) ? 'array' : (is_object($first) ? get_class($first) : gettype($first));
+            $info['first_item_type'] = self::typeOf($first);
             if (is_array($first)) {
                 $info['first_item_keys'] = array_keys($first);
             }
@@ -71,6 +71,18 @@ class ArticleListLoader
         }
 
         return $info;
+    }
+
+    private static function typeOf($v): string
+    {
+        if (is_array($v))   return 'array';
+        if (is_object($v))  return 'object:' . get_class($v);
+        if (is_string($v))  return 'string';
+        if (is_int($v))     return 'int';
+        if (is_float($v))   return 'float';
+        if (is_bool($v))    return 'bool';
+        if (is_null($v))    return 'null';
+        return 'unknown';
     }
 
     private static function idOf($item)
