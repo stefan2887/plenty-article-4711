@@ -14,32 +14,10 @@ class ArticleListController extends Controller
         ItemRepositoryContract $itemRepository,
         AuthHelper $authHelper
     ): string {
-        $items = $authHelper->processUnguarded(function () use ($itemRepository) {
-            return $itemRepository->search([], ['*'], [], 1, 10);
-        });
-
-        $articles = [];
-        foreach ($items->getResult() as $item) {
-            $articles[] = [
-                'id'   => $item['id'] ?? '',
-                'name' => $this->extractName($item),
-            ];
-        }
+        $articles = ArticleListLoader::load($itemRepository, $authHelper);
 
         return $twig->render('ArticleList4711::ArticleList', [
             'articles' => $articles,
         ]);
-    }
-
-    private function extractName(array $item): string
-    {
-        if (!empty($item['texts']) && is_array($item['texts'])) {
-            foreach ($item['texts'] as $text) {
-                if (!empty($text['name1'])) {
-                    return $text['name1'];
-                }
-            }
-        }
-        return '(kein Name)';
     }
 }
