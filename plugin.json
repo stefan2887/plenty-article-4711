@@ -5,7 +5,7 @@
     "description": "Listet 10 Artikel im Plentymarkets-Backend auf",
     "author": "Stefan Kleebauer",
     "serviceProvider": "ArticleList4711\\Providers\\ArticleList4711ServiceProvider",
-    "version": "1.6.0",
+    "version": "1.6.1",
     "license": "MIT",
     "keywords": ["terra", "backend", "items", "list"],
     "shortDescription": {

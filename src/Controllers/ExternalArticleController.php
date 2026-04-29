@@ -197,8 +197,7 @@ class ExternalArticleController extends Controller
     private static function asInt($v): ?int
     {
         if ($v === null || $v === '') return null;
-        if (is_int($v))   return $v;
-        if (is_string($v) && ctype_digit(ltrim($v, '-'))) return (int) $v;
+        if (is_int($v))     return $v;
         if (is_numeric($v)) return (int) $v;
         return null;
     }
