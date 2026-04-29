@@ -4,11 +4,10 @@
     "type": "plugin",
     "description": "Listet 10 Artikel im Plentymarkets-Backend auf",
     "author": "Stefan Kleebauer",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "license": "MIT",
     "shortDescription": {
         "de": "Listet 10 Artikel im Plentymarkets-Backend auf",
         "en": "Lists 10 articles in the Plentymarkets admin backend"
-    },
-    "serviceProvider": "ArticleList4711\\Providers\\ArticleListServiceProvider"
+    }
 }

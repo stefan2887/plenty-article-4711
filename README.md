@@ -1,38 +1,44 @@
 # ArticleList4711
 
-Plentymarkets-Plugin, das im Backend eine einfache Liste der ersten 10 Artikel ausgibt (Item-ID + Name).
+Plentymarkets-Plugin, das eine einfache Liste der ersten 10 Artikel ausgibt (Item-ID + Name).
 
 ## Aufruf nach Installation
 
-Nach Aktivierung des Plugins im gewünschten Plugin-Set sind zwei Routen erreichbar:
+Nach Aktivierung des Plugins im gewünschten Plugin-Set ist die Liste erreichbar unter:
 
 ```
-https://<dein-plenty-shop>/plugin/article-list-4711/articles   → Tabelle mit 10 Artikeln
-https://<dein-plenty-shop>/plugin/article-list-4711/source     → Quellcode aller Plugindateien
+https://<dein-plenty-shop>/plugin/article-list-4711/articles
 ```
 
-Der Aufruf läuft im Backend-Kontext — ein eingeloggter Backend-User wird vorausgesetzt. Die Itemabfrage selbst läuft über `AuthHelper::processUnguarded`, damit die ACL-Prüfung mit dem Admin-Login auskommt.
+Der Aufruf läuft auf der Shop-Domain. Die Itemabfrage selbst läuft über `AuthHelper::processUnguarded`, damit die ACL-Prüfung intern mit Systemrechten auskommt.
+
+## "Backend-Plugin" in Plentymarkets
+
+Plenty unterscheidet im Wesentlichen zwei Plugin-Welten:
+
+1. **Route-/Storefront-basierte Plugins** (was dieses Plugin ist) — registrieren eine URL über `Plenty\Plugin\Routing\Router`. Erreichbar unter der Shop-Domain. Schnell zu bauen, ideal für interne Admin-Tools, die per Bookmark aufgerufen werden.
+2. **Echte Backend-UI-Plugins** — integrieren sich als Menüpunkt/Tab direkt in die Plenty-Adminoberfläche. Setzen das Plenty-eigene UI-Framework (Vue/TS, Container/MenuItem-Registrierung) voraus und sind deutlich aufwendiger.
+
+Für "10 Artikel auflisten" reicht Variante 1. Wenn der Wunsch ist, dass die Liste **innerhalb** der Plenty-Adminoberfläche als Menüpunkt auftaucht, ist Variante 2 nötig — sag Bescheid, dann erweitere ich um die Menü-Registrierung.
 
 ## Open Source / Quellcode-Sichtbarkeit
 
-Plentymarkets-Plugins sind grundsätzlich Open Source aus Sicht des Shopbetreibers — alle PHP-/Twig-Dateien werden vom Plenty-System direkt aus diesem Git-Repository ausgeliefert und können im Backend unter **Plugins → Plugin-Übersicht → ArticleList4711 → Dateibrowser** eingesehen werden. Es findet keine Kompilierung oder Verschlüsselung statt.
-
-Zusätzlich rendert die Route `/plugin/article-list-4711/source` alle Plugindateien live in einer HTML-Ansicht, sodass der ausgeführte Code ohne Umweg über den Dateibrowser sichtbar ist.
+Plentymarkets-Plugins werden als PHP-/Twig-Quelltext ausgeliefert. Im Backend unter **Plugins → Plugin-Übersicht → ArticleList4711 → Dateibrowser** sind alle Dateien einsehbar. Keine Kompilierung, keine Verschlüsselung. Eine Live-Ansicht des Codes aus dem Plugin heraus ist nicht möglich, weil der Plenty-PHP-Sandbox `file_get_contents`/`dirname` nicht erlaubt.
 
 ## Aufbau
 
 ```
-plugin.json                                          Plugin-Manifest
-src/Providers/ArticleListServiceProvider.php         Registriert die Route
-src/Controllers/ArticleListController.php            Holt 10 Items, übergibt sie an die View
-resources/views/ArticleList.twig                     HTML-Tabelle
+plugin.json                                            Plugin-Manifest
+src/Providers/ArticleList4711ServiceProvider.php       Registriert die Route (Konvention: <PluginName>ServiceProvider)
+src/Controllers/ArticleListController.php              Holt 10 Items, übergibt sie an die View
+resources/views/ArticleList.twig                       HTML-Tabelle
 ```
 
 ## Datenquelle
 
 `Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], ['*'], [], 1, 10)` — liefert die erste Seite mit 10 Items inkl. `texts[]`. Der Name wird aus dem ersten verfügbaren `texts[].name1` gezogen.
 
-Falls du stattdessen Varianten oder ElasticSearch-basierte Suche willst, lässt sich der Controller auf `VariationSearchRepositoryContract` bzw. `VariationElasticSearchSearchRepositoryContract` umstellen.
+Falls stattdessen Varianten oder ElasticSearch-basierte Suche gewünscht ist, lässt sich der Controller auf `VariationSearchRepositoryContract` bzw. `VariationElasticSearchSearchRepositoryContract` umstellen.
 
 ## Deployment
 
