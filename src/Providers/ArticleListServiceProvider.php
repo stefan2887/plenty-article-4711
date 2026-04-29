@@ -17,5 +17,10 @@ class ArticleListServiceProvider extends ServiceProvider
             'plugin/article-list-4711/articles',
             'ArticleList4711\Controllers\ArticleListController@showList'
         );
+
+        $router->get(
+            'plugin/article-list-4711/source',
+            'ArticleList4711\Controllers\ArticleListController@showSource'
+        );
     }
 }
