@@ -1,0 +1,12 @@
+{
+    "defaultEntryPoint": "index.html",
+    "namespace": "ArticleList4711",
+    "menuEntries": [
+        {
+            "label": "Artikelliste 4711",
+            "menu": "item",
+            "urlKey": "article-list-4711",
+            "entryPoint": "index.html"
+        }
+    ]
+}

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Artikelliste 4711</title>
+    <style>
+        html, body { margin: 0; padding: 0; }
+        body { font-family: "Segoe UI", Arial, sans-serif; padding: 20px; background: #fff; color: #222; }
+        h1 { font-size: 18px; margin: 0 0 16px 0; color: #2a3f54; }
+        .meta { color: #666; font-size: 12px; margin-bottom: 16px; }
+        table { border-collapse: collapse; width: 100%; max-width: 800px; }
+        th, td { padding: 10px 14px; border-bottom: 1px solid #e6e6e6; text-align: left; font-size: 14px; }
+        th { background: #f4f5f7; color: #444; font-weight: 600; }
+        tr:hover td { background: #fafbfc; }
+        td.idx { width: 40px; color: #888; }
+        td.id  { width: 100px; font-family: Menlo, Consolas, monospace; }
+        .state { padding: 12px 0; color: #666; font-style: italic; }
+        .err   { color: #c0392b; font-style: normal; }
+        button { background: #2a3f54; color: #fff; border: 0; padding: 6px 12px; font-size: 13px; cursor: pointer; border-radius: 3px; margin-left: 8px; }
+        button:hover { background: #1d2d3e; }
+    </style>
+</head>
+<body>
+    <h1>Top 10 Artikel <button id="reload" type="button">Neu laden</button></h1>
+    <div class="meta">Quelle: REST <code>/rest/article-list-4711/articles</code></div>
+    <div id="content" class="state">Lade Artikel…</div>
+
+    <script>
+    (function () {
+        var contentId = 'content';
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, function (c) {
+                return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+            });
+        }
+
+        function render(articles) {
+            var host = document.getElementById(contentId);
+            if (!articles || !articles.length) {
+                host.className = 'state';
+                host.textContent = 'Keine Artikel gefunden.';
+                return;
+            }
+            var rows = articles.map(function (a, i) {
+                return '<tr><td class="idx">' + (i + 1) + '</td>' +
+                       '<td class="id">' + escapeHtml(a.id) + '</td>' +
+                       '<td>' + escapeHtml(a.name) + '</td></tr>';
+            }).join('');
+            host.outerHTML =
+                '<table id="' + contentId + '"><thead><tr><th>#</th><th>Item-ID</th><th>Name</th></tr></thead>' +
+                '<tbody>' + rows + '</tbody></table>';
+        }
+
+        function showError(msg) {
+            var host = document.getElementById(contentId);
+            host.outerHTML = '<div id="' + contentId + '" class="state err">Fehler: ' + escapeHtml(msg) + '</div>';
+        }
+
+        function showLoading() {
+            var host = document.getElementById(contentId);
+            host.outerHTML = '<div id="' + contentId + '" class="state">Lade Artikel…</div>';
+        }
+
+        function load() {
+            showLoading();
+            fetch('/rest/article-list-4711/articles', {
+                credentials: 'include',
+                headers: { 'Accept': 'application/json' }
+            })
+            .then(function (res) {
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return res.json();
+            })
+            .then(function (data) { render((data && data.articles) || []); })
+            .catch(function (err) { showError(err && err.message ? err.message : String(err)); });
+        }
+
+        document.getElementById('reload').addEventListener('click', load);
+        load();
+    })();
+    </script>
+</body>
+</html>
