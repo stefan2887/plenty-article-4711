@@ -1,0 +1,9 @@
+[
+    {
+        "tab": "Externer Zugriff",
+        "key": "external_api_key",
+        "label": "API-Key für externen Zugriff (X-Api-Key Header)",
+        "type": "text",
+        "default": ""
+    }
+]

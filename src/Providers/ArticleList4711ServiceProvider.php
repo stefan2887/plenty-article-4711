@@ -20,10 +20,16 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'ArticleList4711\Controllers\ArticleListController@showList'
         );
 
-        // REST-Endpoint — liefert JSON; wird von ui/index.html im Backend-Iframe konsumiert.
+        // REST-Endpoint für die Backend-UI (ui/index.html).
         $apiRouter->get(
             'article-list-4711/articles',
             'ArticleList4711\Controllers\ArticleListApiController@index'
+        );
+
+        // Externer Endpoint — paginierter Artikel-Export, X-Api-Key-Auth.
+        $apiRouter->get(
+            'article-list-4711/external/articles',
+            'ArticleList4711\Controllers\ExternalArticleController@index'
         );
     }
 }
