@@ -18,7 +18,7 @@ class ArticleListLoader
         AuthHelper $authHelper
     ): array {
         $result = $authHelper->processUnguarded(function () use ($itemRepository) {
-            return $itemRepository->search([], [], 1, 10);
+            return $itemRepository->search([], ['de'], 1, 10, ['texts']);
         });
 
         $entries = $result->getResult();
@@ -47,7 +47,7 @@ class ArticleListLoader
         AuthHelper $authHelper
     ): array {
         $result = $authHelper->processUnguarded(function () use ($itemRepository) {
-            return $itemRepository->search([], [], 1, 10);
+            return $itemRepository->search([], ['de'], 1, 10, ['texts']);
         });
 
         $entries = $result->getResult();
