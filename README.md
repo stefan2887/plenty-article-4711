@@ -30,7 +30,7 @@ Rendert die gleiche Liste serverseitig per Twig.
 ## Aufbau
 
 ```
-plugin.json                                            Plugin-Manifest
+plugin.json                                            Plugin-Manifest (type: backend)
 ui.json                                                Backend-Menüeintrag
 ui/index.html                                          Backend-View (Iframe-Inhalt)
 src/Providers/ArticleList4711ServiceProvider.php       Router + ApiRouter
@@ -38,6 +38,8 @@ src/Controllers/ArticleListController.php              Twig-Route (HTML)
 src/Controllers/ArticleListApiController.php           REST-Endpoint (JSON)
 resources/views/ArticleList.twig                       HTML-Tabelle für die Twig-Route
 ```
+
+`plugin.json` muss `"type": "backend"` setzen — nur damit serviert Plenty die `ui/`-Assets unter dem internen Iframe-Pfad. Mit `"type": "plugin"` wird die `ui.json` zwar gelesen (Menüeintrag erscheint), die View-Datei aber nicht ausgeliefert (404 im iframe).
 
 ## Datenquelle
 
