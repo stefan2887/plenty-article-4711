@@ -31,5 +31,11 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'article-list-4711/external/articles',
             'ArticleList4711\Controllers\ExternalArticleController@index'
         );
+
+        // Externer Endpoint, gefiltert nach storeSpecial-Markierung (1-5).
+        $apiRouter->get(
+            'article-list-4711/external/articles/by-marking/{storeSpecial}',
+            'ArticleList4711\Controllers\ExternalArticleController@byMarking'
+        );
     }
 }

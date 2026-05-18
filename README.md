@@ -31,20 +31,30 @@ Rendert die gleiche Liste serverseitig per Twig.
 
 Paginierter Artikel-Export mit eigener API-Key-Auth — gedacht für externe Systeme (ETL, Sync, Datendrehscheibe).
 
-```
-GET /rest/article-list-4711/external/articles?page=1&per_page=100&lang=de
-Header: X-Api-Key: <der-im-Backend-konfigurierte-Key>
-```
+**Zwei Routen:**
+
+| Route | Zweck |
+|---|---|
+| `GET /rest/article-list-4711/external/articles` | Alle Artikel, paginiert |
+| `GET /rest/article-list-4711/external/articles/by-marking/{storeSpecial}` | Artikel gefiltert nach Plenty-Standardmarkierung |
+
+Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter und liefern das gleiche Response-Schema (die Filter-Route fügt einen zusätzlichen `filter`-Block hinzu).
 
 **API-Key setzen:** Plenty-Backend → **Plugins → Plugin-Übersicht → ArticleList4711 → Konfiguration**, Tab *Externer Zugriff*. Solange der Key leer ist, wird **jeder Aufruf mit 401 abgelehnt** (kein Default-Key).
 
-**Query-Parameter:**
+**Query-Parameter (beide Routen):**
 
 | Param | Default | Max | Beschreibung |
 |---|---|---|---|
 | `page` | `1` | — | 1-basierte Seite |
 | `per_page` | `50` | `200` | Items pro Seite (hartes Maximum: 200) |
 | `lang` | `de` | — | Bevorzugte Sprache für `primary_name`; `texts_by_lang` enthält alle verfügbaren Sprachen |
+
+**Route-Parameter (nur `by-marking`):**
+
+| Param | Wertebereich | Beschreibung |
+|---|---|---|
+| `storeSpecial` | int | Plenty-Standardmarkierung. `0` = keine, `1` = Schnäppchen, `2` = Neu, `3` = Top-Artikel, `4` = reduziert, `5` = Sonderpreis. (Werte entsprechen Plenty-Default; bei abweichender Shop-Konfiguration im Backend prüfen.) |
 
 **Response-Schema (`schema_version: "1"`):**
 
@@ -56,6 +66,7 @@ Header: X-Api-Key: <der-im-Backend-konfigurierte-Key>
       "position": 0,
       "manufacturer_id": null,
       "stock_limitation": 0,
+      "store_special": 3,
       "created_at": "2024-01-15T08:30:00+00:00",
       "updated_at": "2026-04-29T10:15:00+00:00",
       "primary_name": "Artikelname Deutsch",
@@ -64,14 +75,26 @@ Header: X-Api-Key: <der-im-Backend-konfigurierte-Key>
           "name1": "Artikelname Deutsch",
           "name2": null,
           "name3": null,
-          "description": "...",
-          "short_description": null,
+          "description": "<p>HTML-Langbeschreibung…</p>",
+          "short_description": "Kurzbeschreibung",
           "technical_data": null,
           "meta_keywords": null,
           "meta_description": null,
           "url_path": "artikelname-deutsch"
         }
-      }
+      },
+      "images": [
+        {
+          "id": 9876,
+          "position": 0,
+          "type": "internal",
+          "file_type": "jpg",
+          "path": "S3:9876:item-name.jpg",
+          "url":         "https://<shop>/item/images/9876/0_source_item-name.jpg",
+          "url_preview": "https://<shop>/item/images/9876/0_preview_item-name.jpg",
+          "url_middle":  "https://<shop>/item/images/9876/0_middle_item-name.jpg"
+        }
+      ]
     }
   ],
   "pagination": {
@@ -87,11 +110,25 @@ Header: X-Api-Key: <der-im-Backend-konfigurierte-Key>
     "fetched_at": "2026-04-29T14:32:00+00:00",
     "endpoint": "/rest/article-list-4711/external/articles",
     "lang": "de",
-    "with": ["texts"],
+    "with": ["texts", "itemImages"],
     "schema_version": "1"
   }
 }
 ```
+
+Bei `by-marking` kommen zwei zusätzliche Felder dazu — alles andere ist identisch:
+
+```json
+{
+  "filter": { "store_special": 3 },
+  "meta":   { "...": "...", "filter_applied": "post_load_php" }
+}
+```
+
+`filter_applied: "post_load_php"` signalisiert, dass der Filter **nach** dem Plenty-Load im PHP angewandt wird. Konsequenzen:
+- `pagination.total_count` ist die ungefilterte Plenty-Summe, nicht die Anzahl der Treffer.
+- `pagination.returned_count` zeigt die Treffer **dieser Seite** nach Filter.
+- Für ein vollständiges gefiltertes Set: Loop bis `has_next_page == false`, client-seitig sammeln. `per_page=200` empfohlen, um die Round-Trips zu reduzieren.
 
 **Loop-Konvention für vollständigen Sync (Pseudocode):**
 
@@ -117,7 +154,7 @@ Stabilitätsgarantien:
 - snake_case Feldnamen.
 - ISO-8601-Zeitstempel inkl. Offset.
 - Felder, die unbekannt/leer sind, sind explizit `null` (statt zu fehlen).
-- Schema-Inkrement (`schema_version`) bei brechenden Änderungen.
+- Schema-Inkrement (`schema_version`) bei brechenden Änderungen. Additive Felder (neue Keys in `data[]` oder `meta`) sind kein Inkrement-Anlass — der Konsument sollte unbekannte Keys tolerant ignorieren.
 
 ## Aufbau
 
@@ -138,9 +175,9 @@ resources/views/ArticleList.twig                       HTML-Tabelle für die Twi
 
 ## Datenquelle
 
-`Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], ['*'], [], 1, 10)` in `AuthHelper::processUnguarded`. Der Name wird aus dem ersten verfügbaren `texts[].name1` gezogen.
+`Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], [$lang], $page, $perPage, ['texts', 'itemImages'])` in `AuthHelper::processUnguarded`. Der Name wird aus dem ersten verfügbaren `texts[].name1` gezogen, Bilder kommen aus der `itemImages`-Relation.
 
-Bei Bedarf umstellbar auf `VariationSearchRepositoryContract` oder `VariationElasticSearchSearchRepositoryContract`.
+Der externe `by-marking`-Endpoint filtert **nach** dem Plenty-Load im PHP, weil `ItemRepositoryContract::search()` keinen `storeSpecial`-Filter unterstützt. Bei wachsender Datenmenge (>>1000 Items) wäre der Umstieg auf `VariationElasticSearchSearchRepositoryContract` mit echtem Server-Side-Filter sinnvoll.
 
 ## Hinweise zur Plenty-Sandbox
 

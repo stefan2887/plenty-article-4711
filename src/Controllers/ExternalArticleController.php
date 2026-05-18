@@ -24,7 +24,75 @@ class ExternalArticleController extends Controller
         ItemRepositoryContract $itemRepository,
         AuthHelper $authHelper
     ) {
-        // --- Auth -----------------------------------------------------------
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        list($page, $perPage, $lang) = self::parsePagination($request);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $page, $perPage, $lang);
+
+        return $response->json([
+            'data'       => $loaded['articles'],
+            'pagination' => $loaded['pagination'],
+            'meta'       => self::baseMeta($request) + [
+                'lang'           => $lang,
+                'with'           => ['texts', 'itemImages'],
+                'schema_version' => self::SCHEMA_VERSION,
+            ],
+        ], 200);
+    }
+
+    /**
+     * Externer Endpoint, gefiltert nach Plenty-`storeSpecial`-Markierung.
+     * storeSpecial ist eine Item-Eigenschaft (0=keine, 1-5=Plenty-Standardwerte
+     * wie Schnäppchen/Neu/Top-Artikel/etc.). Routen-Param: beliebige int.
+     *
+     * Filter wird im PHP nach dem Plenty-Load angewandt — `pagination.total_count`
+     * bleibt die ungefilterte Plenty-Summe; `pagination.returned_count` und das
+     * `filter`-Feld zeigen das gefilterte Ergebnis. Für vollständigen Filter-Sync
+     * den Loop bis `has_next_page == false` laufen lassen und client-seitig
+     * sammeln.
+     */
+    public function byMarking(
+        Request $request,
+        Response $response,
+        ConfigRepository $config,
+        ItemRepositoryContract $itemRepository,
+        AuthHelper $authHelper,
+        int $storeSpecial
+    ) {
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        list($page, $perPage, $lang) = self::parsePagination($request);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $page, $perPage, $lang);
+
+        $filtered = [];
+        foreach ($loaded['articles'] as $article) {
+            if ((int) $article['store_special'] === $storeSpecial) {
+                $filtered[] = $article;
+            }
+        }
+
+        $pagination = $loaded['pagination'];
+        $pagination['returned_count'] = count($filtered);
+
+        return $response->json([
+            'data'       => $filtered,
+            'pagination' => $pagination,
+            'filter'     => [
+                'store_special' => $storeSpecial,
+            ],
+            'meta'       => self::baseMeta($request) + [
+                'lang'           => $lang,
+                'with'           => ['texts', 'itemImages'],
+                'filter_applied' => 'post_load_php',
+                'schema_version' => self::SCHEMA_VERSION,
+            ],
+        ], 200);
+    }
+
+    private static function requireValidApiKey(Request $request, Response $response, ConfigRepository $config)
+    {
         $expected = (string) $config->get('ArticleList4711.external_api_key', '');
         $provided = (string) $request->header('X-Api-Key');
 
@@ -37,8 +105,11 @@ class ExternalArticleController extends Controller
                 'meta' => self::baseMeta($request),
             ], 401);
         }
+        return null;
+    }
 
-        // --- Paginierung ----------------------------------------------------
+    private static function parsePagination(Request $request): array
+    {
         $page    = (int) $request->get('page', 1);
         $perPage = (int) $request->get('per_page', self::DEFAULT_PER_PAGE);
         if ($page    < 1) $page    = 1;
@@ -48,9 +119,18 @@ class ExternalArticleController extends Controller
         $lang = (string) $request->get('lang', 'de');
         if ($lang === '') $lang = 'de';
 
-        // --- Daten holen ----------------------------------------------------
+        return [$page, $perPage, $lang];
+    }
+
+    private static function loadArticlePage(
+        AuthHelper $authHelper,
+        ItemRepositoryContract $itemRepository,
+        int $page,
+        int $perPage,
+        string $lang
+    ): array {
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
-            return $itemRepository->search([], [$lang], $page, $perPage, ['texts']);
+            return $itemRepository->search([], [$lang], $page, $perPage, ['texts', 'itemImages']);
         });
 
         $entries = $paginated->getResult();
@@ -62,7 +142,6 @@ class ExternalArticleController extends Controller
             }
         }
 
-        // --- Pagination-Metadaten via toArray() (laut Plenty-Doku verfügbar) -
         $totalCount  = null;
         $isLastPage  = null;
         $lastPageNum = null;
@@ -73,8 +152,8 @@ class ExternalArticleController extends Controller
             if (isset($paginatedArr['lastPageNumber'])) $lastPageNum = (int) $paginatedArr['lastPageNumber'];
         }
 
-        return $response->json([
-            'data' => $articles,
+        return [
+            'articles'   => $articles,
             'pagination' => [
                 'page'           => $page,
                 'per_page'       => $perPage,
@@ -84,12 +163,7 @@ class ExternalArticleController extends Controller
                 'is_last_page'   => $isLastPage,
                 'has_next_page'  => $isLastPage === null ? null : ! $isLastPage,
             ],
-            'meta' => self::baseMeta($request) + [
-                'lang'           => $lang,
-                'with'           => ['texts'],
-                'schema_version' => self::SCHEMA_VERSION,
-            ],
-        ], 200);
+        ];
     }
 
     /**
@@ -104,10 +178,12 @@ class ExternalArticleController extends Controller
             'position'         => self::asInt(self::pick($item, 'position')),
             'manufacturer_id'  => self::asInt(self::pick($item, 'manufacturerId')),
             'stock_limitation' => self::asInt(self::pick($item, 'stockLimitation')),
+            'store_special'    => self::asInt(self::pick($item, 'storeSpecial')),
             'created_at'       => self::asIsoDate(self::pick($item, 'createdAt')),
             'updated_at'       => self::asIsoDate(self::pick($item, 'updatedAt')),
             'texts_by_lang'    => self::extractTextsByLang($item),
             'primary_name'     => self::primaryName($item, $lang),
+            'images'           => self::extractImages($item),
         ];
     }
 
@@ -123,9 +199,11 @@ class ExternalArticleController extends Controller
                 case 'position':        return isset($item->position)        ? $item->position        : null;
                 case 'manufacturerId':  return isset($item->manufacturerId)  ? $item->manufacturerId  : null;
                 case 'stockLimitation': return isset($item->stockLimitation) ? $item->stockLimitation : null;
+                case 'storeSpecial':    return isset($item->storeSpecial)    ? $item->storeSpecial    : null;
                 case 'createdAt':       return isset($item->createdAt)       ? $item->createdAt       : null;
                 case 'updatedAt':       return isset($item->updatedAt)       ? $item->updatedAt       : null;
                 case 'texts':           return isset($item->texts)           ? $item->texts           : null;
+                case 'itemImages':      return isset($item->itemImages)      ? $item->itemImages      : null;
             }
         }
         return null;
@@ -176,6 +254,49 @@ class ExternalArticleController extends Controller
                 case 'keywords':         return isset($t->keywords)         ? $t->keywords         : null;
                 case 'metaDescription':  return isset($t->metaDescription)  ? $t->metaDescription  : null;
                 case 'urlPath':          return isset($t->urlPath)          ? $t->urlPath          : null;
+            }
+        }
+        return null;
+    }
+
+    private static function extractImages($item): array
+    {
+        $images = self::pick($item, 'itemImages');
+        if ($images === null || (!is_array($images) && !is_object($images))) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($images as $img) {
+            $out[] = [
+                'id'          => self::asInt(self::imageField($img, 'id')),
+                'position'    => self::asInt(self::imageField($img, 'position')),
+                'type'        => self::asString(self::imageField($img, 'type')),
+                'file_type'   => self::asString(self::imageField($img, 'fileType')),
+                'path'        => self::asString(self::imageField($img, 'path')),
+                'url'         => self::asString(self::imageField($img, 'url')),
+                'url_preview' => self::asString(self::imageField($img, 'urlPreview')),
+                'url_middle'  => self::asString(self::imageField($img, 'urlMiddle')),
+            ];
+        }
+        return $out;
+    }
+
+    private static function imageField($img, string $key)
+    {
+        if (is_array($img)) {
+            return $img[$key] ?? null;
+        }
+        if (is_object($img)) {
+            switch ($key) {
+                case 'id':         return isset($img->id)         ? $img->id         : null;
+                case 'position':   return isset($img->position)   ? $img->position   : null;
+                case 'type':       return isset($img->type)       ? $img->type       : null;
+                case 'fileType':   return isset($img->fileType)   ? $img->fileType   : null;
+                case 'path':       return isset($img->path)       ? $img->path       : null;
+                case 'url':        return isset($img->url)        ? $img->url        : null;
+                case 'urlPreview': return isset($img->urlPreview) ? $img->urlPreview : null;
+                case 'urlMiddle':  return isset($img->urlMiddle)  ? $img->urlMiddle  : null;
             }
         }
         return null;
