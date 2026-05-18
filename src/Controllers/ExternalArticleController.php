@@ -17,6 +17,30 @@ class ExternalArticleController extends Controller
     const DEFAULT_PER_PAGE = 50;
     const MAX_PER_PAGE     = 200;
 
+    /**
+     * Eager-Load-Liste für ItemRepositoryContract::search().
+     * Punkt-Notation für Sub-Relations der Variations — wenn der Plenty-with-Resolver
+     * die nicht eager auflöst, kommen die Sub-Felder im Response als leere Arrays
+     * (kein Crash); siehe README ("Datenquelle").
+     */
+    private static function relations(): array
+    {
+        return [
+            'texts',
+            'itemImages',
+            'variations',
+            'variations.variationSalesPrices',
+            'variations.variationBarcodes',
+            'variations.variationCategories',
+            'variations.variationClients',
+            'variations.variationMarkets',
+            'variations.variationProperties',
+            'variations.variationAttributeValues',
+            'variations.unit',
+            'variations.stock',
+        ];
+    }
+
     public function index(
         Request $request,
         Response $response,
@@ -35,7 +59,7 @@ class ExternalArticleController extends Controller
             'pagination' => $loaded['pagination'],
             'meta'       => self::baseMeta($request) + [
                 'lang'           => $lang,
-                'with'           => ['texts', 'itemImages'],
+                'with'           => self::relations(),
                 'schema_version' => self::SCHEMA_VERSION,
             ],
         ], 200);
@@ -84,7 +108,7 @@ class ExternalArticleController extends Controller
             ],
             'meta'       => self::baseMeta($request) + [
                 'lang'           => $lang,
-                'with'           => ['texts', 'itemImages'],
+                'with'           => self::relations(),
                 'filter_applied' => 'post_load_php',
                 'schema_version' => self::SCHEMA_VERSION,
             ],
@@ -130,7 +154,7 @@ class ExternalArticleController extends Controller
         string $lang
     ): array {
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
-            return $itemRepository->search([], [$lang], $page, $perPage, ['texts', 'itemImages']);
+            return $itemRepository->search([], [$lang], $page, $perPage, self::relations());
         });
 
         $entries = $paginated->getResult();
@@ -184,6 +208,7 @@ class ExternalArticleController extends Controller
             'texts_by_lang'    => self::extractTextsByLang($item),
             'primary_name'     => self::primaryName($item, $lang),
             'images'           => self::extractImages($item),
+            'variations'       => self::extractVariations($item),
         ];
     }
 
@@ -204,6 +229,7 @@ class ExternalArticleController extends Controller
                 case 'updatedAt':       return isset($item->updatedAt)       ? $item->updatedAt       : null;
                 case 'texts':           return isset($item->texts)           ? $item->texts           : null;
                 case 'itemImages':      return isset($item->itemImages)      ? $item->itemImages      : null;
+                case 'variations':      return isset($item->variations)      ? $item->variations      : null;
             }
         }
         return null;
@@ -349,5 +375,332 @@ class ExternalArticleController extends Controller
             'fetched_at' => date('c'),
             'endpoint'   => '/rest/article-list-4711/external/articles',
         ];
+    }
+
+    // ------------------------------------------------------------------
+    // Variations + Sub-Relations
+    //
+    // Hinweis zur Plenty-`with`-Resolver-Semantik: `ItemRepositoryContract::search()`
+    // löst die Punkt-Notation für Variation-Sub-Relations nicht garantiert eager
+    // auf. Wenn ein Sub-Feld leer (`[]` / `null`) ankommt, ist das kein Fehler im
+    // Serializer — dann liefert Plenty die Daten schlicht nicht mit. Konsequenz für
+    // Konsumenten: ein leeres `prices`/`stock`/etc. heißt "nicht geladen", nicht
+    // "es gibt keine".
+    // ------------------------------------------------------------------
+
+    private static function extractVariations($item): array
+    {
+        $variations = self::pick($item, 'variations');
+        if ($variations === null || (!is_array($variations) && !is_object($variations))) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($variations as $v) {
+            $out[] = self::serializeVariation($v);
+        }
+        return $out;
+    }
+
+    private static function serializeVariation($v): array
+    {
+        return [
+            'id'                  => self::asInt(self::prop($v, 'id')),
+            'item_id'             => self::asInt(self::prop($v, 'itemId')),
+            'number'              => self::asString(self::prop($v, 'number')),
+            'is_main'             => self::asBool(self::prop($v, 'isMain')),
+            'is_active'           => self::asBool(self::prop($v, 'isActive')),
+            'position'            => self::asInt(self::prop($v, 'position')),
+            'external_id'         => self::asString(self::prop($v, 'externalId')),
+            'model'               => self::asString(self::prop($v, 'model')),
+            'vat_id'              => self::asInt(self::prop($v, 'vatId')),
+            'weight_g'            => self::asInt(self::prop($v, 'weightG')),
+            'weight_net_g'        => self::asInt(self::prop($v, 'weightNetG')),
+            'width_mm'            => self::asInt(self::prop($v, 'widthMM')),
+            'length_mm'           => self::asInt(self::prop($v, 'lengthMM')),
+            'height_mm'           => self::asInt(self::prop($v, 'heightMM')),
+            'packing_units'       => self::asInt(self::prop($v, 'packingUnits')),
+            'packing_unit_type_id'=> self::asInt(self::prop($v, 'packingUnitTypeId')),
+            'main_warehouse_id'   => self::asInt(self::prop($v, 'mainWarehouseId')),
+            'picking'             => self::asString(self::prop($v, 'picking')),
+            'stock_limitation'    => self::asInt(self::prop($v, 'stockLimitation')),
+            'released_at'         => self::asIsoDate(self::prop($v, 'releasedAt')),
+            'available_until'     => self::asIsoDate(self::prop($v, 'availableUntil')),
+            'created_at'          => self::asIsoDate(self::prop($v, 'createdAt')),
+            'updated_at'          => self::asIsoDate(self::prop($v, 'updatedAt')),
+            'prices'              => self::extractPrices(self::prop($v, 'variationSalesPrices')),
+            'stock'               => self::extractStock(self::prop($v, 'stock')),
+            'barcodes'            => self::extractBarcodes(self::prop($v, 'variationBarcodes')),
+            'categories'          => self::extractCategories(self::prop($v, 'variationCategories')),
+            'properties'          => self::extractProperties(self::prop($v, 'variationProperties')),
+            'clients'             => self::extractClients(self::prop($v, 'variationClients')),
+            'markets'             => self::extractMarkets(self::prop($v, 'variationMarkets')),
+            'attribute_values'    => self::extractAttributeValues(self::prop($v, 'variationAttributeValues')),
+            'unit'                => self::serializeUnit(self::prop($v, 'unit')),
+        ];
+    }
+
+    /** Gemeinsamer "iterable or empty"-Check für alle Sub-Collections. */
+    private static function isIterable_($c): bool
+    {
+        return is_array($c) || is_object($c);
+    }
+
+    private static function extractPrices($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $p) { $out[] = self::serializePrice($p); }
+        return $out;
+    }
+
+    private static function extractStock($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $s) { $out[] = self::serializeStock($s); }
+        return $out;
+    }
+
+    private static function extractBarcodes($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $b) { $out[] = self::serializeBarcode($b); }
+        return $out;
+    }
+
+    private static function extractCategories($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $cat) { $out[] = self::serializeCategory($cat); }
+        return $out;
+    }
+
+    private static function extractProperties($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $p) { $out[] = self::serializeProperty($p); }
+        return $out;
+    }
+
+    private static function extractClients($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $cl) { $out[] = self::serializeClient($cl); }
+        return $out;
+    }
+
+    private static function extractMarkets($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $m) { $out[] = self::serializeMarket($m); }
+        return $out;
+    }
+
+    private static function extractAttributeValues($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $a) { $out[] = self::serializeAttributeValue($a); }
+        return $out;
+    }
+
+    private static function serializePrice($p): array
+    {
+        return [
+            'sales_price_id' => self::asInt(self::prop($p, 'salesPriceId')),
+            'price'          => self::asFloat(self::prop($p, 'price')),
+            'currency'       => self::asString(self::prop($p, 'currency')),
+            'updated_at'     => self::asIsoDate(self::prop($p, 'updatedAt')),
+        ];
+    }
+
+    private static function serializeStock($s): array
+    {
+        return [
+            'warehouse_id'    => self::asInt(self::prop($s, 'warehouseId')),
+            'stock_net'       => self::asFloat(self::prop($s, 'stockNet')),
+            'physical_stock'  => self::asFloat(self::prop($s, 'physicalStock')),
+            'reserved_stock'  => self::asFloat(self::prop($s, 'reservedStock')),
+            'updated_at'      => self::asIsoDate(self::prop($s, 'updatedAt')),
+        ];
+    }
+
+    private static function serializeBarcode($b): array
+    {
+        return [
+            'barcode_id' => self::asInt(self::prop($b, 'barcodeId')),
+            'code'       => self::asString(self::prop($b, 'code')),
+            'created_at' => self::asIsoDate(self::prop($b, 'createdAt')),
+        ];
+    }
+
+    private static function serializeCategory($c): array
+    {
+        return [
+            'category_id' => self::asInt(self::prop($c, 'categoryId')),
+            'plenty_id'   => self::asInt(self::prop($c, 'plentyId')),
+            'position'    => self::asInt(self::prop($c, 'position')),
+            'is_default'  => self::asBool(self::prop($c, 'isDefault')),
+        ];
+    }
+
+    private static function serializeProperty($p): array
+    {
+        return [
+            'property_id'     => self::asInt(self::prop($p, 'propertyId')),
+            'value_int'       => self::asInt(self::prop($p, 'valueInt')),
+            'value_float'     => self::asFloat(self::prop($p, 'valueFloat')),
+            'value_string'    => self::asString(self::prop($p, 'valueString')),
+            'value_selection' => self::asInt(self::prop($p, 'valueSelection')),
+            'surcharge'       => self::asFloat(self::prop($p, 'surcharge')),
+        ];
+    }
+
+    private static function serializeClient($c): array
+    {
+        return [
+            'plenty_id' => self::asInt(self::prop($c, 'plentyId')),
+        ];
+    }
+
+    private static function serializeMarket($m): array
+    {
+        return [
+            'market_id'   => self::asInt(self::prop($m, 'marketId')),
+            'sku'         => self::asString(self::prop($m, 'sku')),
+            'initial_sku' => self::asString(self::prop($m, 'initialSku')),
+        ];
+    }
+
+    private static function serializeAttributeValue($a): array
+    {
+        return [
+            'attribute_id'       => self::asInt(self::prop($a, 'attributeId')),
+            'attribute_value_id' => self::asInt(self::prop($a, 'attributeValueId')),
+        ];
+    }
+
+    private static function serializeUnit($u)
+    {
+        if ($u === null || (!is_array($u) && !is_object($u))) {
+            return null;
+        }
+        return [
+            'unit_id' => self::asInt(self::prop($u, 'unitId')),
+            'content' => self::asFloat(self::prop($u, 'content')),
+        ];
+    }
+
+    /**
+     * Sandbox-konformer Property-Zugriff für alle Variation-Sub-Typen.
+     * Ein zentraler switch statt 10 spiegelbildlicher Field-Helper —
+     * die Property-Namen kollidieren nicht praktisch (mehrere Sub-Typen
+     * haben `id`/`updatedAt`/etc., aber `$obj->id` funktioniert für alle).
+     */
+    private static function prop($obj, string $key)
+    {
+        if (is_array($obj)) {
+            return $obj[$key] ?? null;
+        }
+        if (!is_object($obj)) {
+            return null;
+        }
+        switch ($key) {
+            // Variation core
+            case 'id':                          return isset($obj->id)                          ? $obj->id                          : null;
+            case 'itemId':                      return isset($obj->itemId)                      ? $obj->itemId                      : null;
+            case 'isMain':                      return isset($obj->isMain)                      ? $obj->isMain                      : null;
+            case 'isActive':                    return isset($obj->isActive)                    ? $obj->isActive                    : null;
+            case 'number':                      return isset($obj->number)                      ? $obj->number                      : null;
+            case 'position':                    return isset($obj->position)                    ? $obj->position                    : null;
+            case 'externalId':                  return isset($obj->externalId)                  ? $obj->externalId                  : null;
+            case 'model':                       return isset($obj->model)                       ? $obj->model                       : null;
+            case 'vatId':                       return isset($obj->vatId)                       ? $obj->vatId                       : null;
+            case 'weightG':                     return isset($obj->weightG)                     ? $obj->weightG                     : null;
+            case 'weightNetG':                  return isset($obj->weightNetG)                  ? $obj->weightNetG                  : null;
+            case 'widthMM':                     return isset($obj->widthMM)                     ? $obj->widthMM                     : null;
+            case 'lengthMM':                    return isset($obj->lengthMM)                    ? $obj->lengthMM                    : null;
+            case 'heightMM':                    return isset($obj->heightMM)                    ? $obj->heightMM                    : null;
+            case 'packingUnits':                return isset($obj->packingUnits)                ? $obj->packingUnits                : null;
+            case 'packingUnitTypeId':           return isset($obj->packingUnitTypeId)           ? $obj->packingUnitTypeId           : null;
+            case 'mainWarehouseId':             return isset($obj->mainWarehouseId)             ? $obj->mainWarehouseId             : null;
+            case 'picking':                     return isset($obj->picking)                     ? $obj->picking                     : null;
+            case 'stockLimitation':             return isset($obj->stockLimitation)             ? $obj->stockLimitation             : null;
+            case 'releasedAt':                  return isset($obj->releasedAt)                  ? $obj->releasedAt                  : null;
+            case 'availableUntil':              return isset($obj->availableUntil)              ? $obj->availableUntil              : null;
+            case 'createdAt':                   return isset($obj->createdAt)                   ? $obj->createdAt                   : null;
+            case 'updatedAt':                   return isset($obj->updatedAt)                   ? $obj->updatedAt                   : null;
+            // Variation sub-collections
+            case 'variationSalesPrices':        return isset($obj->variationSalesPrices)        ? $obj->variationSalesPrices        : null;
+            case 'stock':                       return isset($obj->stock)                       ? $obj->stock                       : null;
+            case 'variationBarcodes':           return isset($obj->variationBarcodes)           ? $obj->variationBarcodes           : null;
+            case 'variationCategories':         return isset($obj->variationCategories)         ? $obj->variationCategories         : null;
+            case 'variationProperties':         return isset($obj->variationProperties)         ? $obj->variationProperties         : null;
+            case 'variationClients':            return isset($obj->variationClients)            ? $obj->variationClients            : null;
+            case 'variationMarkets':            return isset($obj->variationMarkets)            ? $obj->variationMarkets            : null;
+            case 'variationAttributeValues':    return isset($obj->variationAttributeValues)    ? $obj->variationAttributeValues    : null;
+            case 'unit':                        return isset($obj->unit)                        ? $obj->unit                        : null;
+            // SalesPrice
+            case 'salesPriceId':                return isset($obj->salesPriceId)                ? $obj->salesPriceId                : null;
+            case 'price':                       return isset($obj->price)                       ? $obj->price                       : null;
+            case 'currency':                    return isset($obj->currency)                    ? $obj->currency                    : null;
+            // Stock
+            case 'warehouseId':                 return isset($obj->warehouseId)                 ? $obj->warehouseId                 : null;
+            case 'stockNet':                    return isset($obj->stockNet)                    ? $obj->stockNet                    : null;
+            case 'physicalStock':               return isset($obj->physicalStock)               ? $obj->physicalStock               : null;
+            case 'reservedStock':               return isset($obj->reservedStock)               ? $obj->reservedStock               : null;
+            // Barcode
+            case 'barcodeId':                   return isset($obj->barcodeId)                   ? $obj->barcodeId                   : null;
+            case 'code':                        return isset($obj->code)                        ? $obj->code                        : null;
+            // Category
+            case 'categoryId':                  return isset($obj->categoryId)                  ? $obj->categoryId                  : null;
+            case 'plentyId':                    return isset($obj->plentyId)                    ? $obj->plentyId                    : null;
+            case 'isDefault':                   return isset($obj->isDefault)                   ? $obj->isDefault                   : null;
+            // Property
+            case 'propertyId':                  return isset($obj->propertyId)                  ? $obj->propertyId                  : null;
+            case 'valueInt':                    return isset($obj->valueInt)                    ? $obj->valueInt                    : null;
+            case 'valueFloat':                  return isset($obj->valueFloat)                  ? $obj->valueFloat                  : null;
+            case 'valueString':                 return isset($obj->valueString)                 ? $obj->valueString                 : null;
+            case 'valueSelection':              return isset($obj->valueSelection)              ? $obj->valueSelection              : null;
+            case 'surcharge':                   return isset($obj->surcharge)                   ? $obj->surcharge                   : null;
+            // Market
+            case 'marketId':                    return isset($obj->marketId)                    ? $obj->marketId                    : null;
+            case 'sku':                         return isset($obj->sku)                         ? $obj->sku                         : null;
+            case 'initialSku':                  return isset($obj->initialSku)                  ? $obj->initialSku                  : null;
+            // Unit
+            case 'unitId':                      return isset($obj->unitId)                      ? $obj->unitId                      : null;
+            case 'content':                     return isset($obj->content)                     ? $obj->content                     : null;
+            // AttributeValue
+            case 'attributeId':                 return isset($obj->attributeId)                 ? $obj->attributeId                 : null;
+            case 'attributeValueId':            return isset($obj->attributeValueId)            ? $obj->attributeValueId            : null;
+        }
+        return null;
+    }
+
+    private static function asBool($v): ?bool
+    {
+        if ($v === null) return null;
+        if (is_bool($v)) return $v;
+        if (is_int($v)) return $v !== 0;
+        if (is_string($v)) {
+            if ($v === '1' || strcasecmp($v, 'true') === 0)  return true;
+            if ($v === '0' || strcasecmp($v, 'false') === 0) return false;
+        }
+        return null;
+    }
+
+    private static function asFloat($v): ?float
+    {
+        if ($v === null || $v === '') return null;
+        if (is_float($v))   return $v;
+        if (is_int($v))     return (float) $v;
+        if (is_numeric($v)) return (float) $v;
+        return null;
     }
 }

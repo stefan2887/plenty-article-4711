@@ -94,6 +94,40 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
           "url_preview": "https://<shop>/item/images/9876/0_preview_item-name.jpg",
           "url_middle":  "https://<shop>/item/images/9876/0_middle_item-name.jpg"
         }
+      ],
+      "variations": [
+        {
+          "id": 1234,
+          "item_id": 12345,
+          "number": "SKU-12345-XL",
+          "is_main": true,
+          "is_active": true,
+          "position": 0,
+          "external_id": null,
+          "model": null,
+          "vat_id": 1,
+          "weight_g": 250,
+          "weight_net_g": 230,
+          "width_mm": 100, "length_mm": 100, "height_mm": 50,
+          "packing_units": 1,
+          "packing_unit_type_id": null,
+          "main_warehouse_id": 0,
+          "picking": null,
+          "stock_limitation": 0,
+          "released_at": "2024-01-15T08:30:00+00:00",
+          "available_until": null,
+          "created_at": "2024-01-15T08:30:00+00:00",
+          "updated_at": "2026-04-29T10:15:00+00:00",
+          "prices":     [{ "sales_price_id": 1, "price": 19.99, "currency": "EUR", "updated_at": "..." }],
+          "stock":      [{ "warehouse_id": 0,  "stock_net": 42, "physical_stock": 50, "reserved_stock": 8, "updated_at": "..." }],
+          "barcodes":   [{ "barcode_id": 1, "code": "4006381333933", "created_at": "..." }],
+          "categories": [{ "category_id": 12, "plenty_id": 0, "position": 0, "is_default": true }],
+          "properties": [{ "property_id": 5, "value_int": null, "value_float": null, "value_string": "Edelstahl", "value_selection": null, "surcharge": null }],
+          "clients":    [{ "plenty_id": 0 }],
+          "markets":    [{ "market_id": 102, "sku": "...", "initial_sku": "..." }],
+          "attribute_values": [{ "attribute_id": 1, "attribute_value_id": 7 }],
+          "unit": { "unit_id": 1, "content": 1.0 }
+        }
       ]
     }
   ],
@@ -110,11 +144,13 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
     "fetched_at": "2026-04-29T14:32:00+00:00",
     "endpoint": "/rest/article-list-4711/external/articles",
     "lang": "de",
-    "with": ["texts", "itemImages"],
+    "with": ["texts", "itemImages", "variations", "variations.variationSalesPrices", "..."],
     "schema_version": "1"
   }
 }
 ```
+
+**Hinweis zu `variations[].*` Sub-Feldern:** Plenty's `ItemRepositoryContract::search()` löst die Punkt-Notation für verschachtelte Variation-Relations (Preise, Stock, Properties, etc.) nicht garantiert eager auf. Wenn ein Sub-Array leer (`[]`) ankommt, heißt das **"nicht geladen"**, nicht "es gibt keine Daten". Bei Bedarf: über `VariationElasticSearchSearchRepositoryContract` mit eigenem `setSearchParams()` umstellen — siehe „Datenquelle".
 
 Bei `by-marking` kommen zwei zusätzliche Felder dazu — alles andere ist identisch:
 
@@ -175,9 +211,11 @@ resources/views/ArticleList.twig                       HTML-Tabelle für die Twi
 
 ## Datenquelle
 
-`Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], [$lang], $page, $perPage, ['texts', 'itemImages'])` in `AuthHelper::processUnguarded`. Der Name wird aus dem ersten verfügbaren `texts[].name1` gezogen, Bilder kommen aus der `itemImages`-Relation.
+`Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], [$lang], $page, $perPage, $relations)` in `AuthHelper::processUnguarded`. Die `$relations` werden zentral in `ExternalArticleController::relations()` gepflegt und umfassen `texts`, `itemImages`, `variations` plus Punkt-Notation für Variations-Sub-Relations (`variations.variationSalesPrices`, `variations.stock`, `variations.variationBarcodes`, `variations.variationCategories`, `variations.variationProperties`, `variations.variationClients`, `variations.variationMarkets`, `variations.unit`, `variations.variationAttributeValues`).
 
-Der externe `by-marking`-Endpoint filtert **nach** dem Plenty-Load im PHP, weil `ItemRepositoryContract::search()` keinen `storeSpecial`-Filter unterstützt. Bei wachsender Datenmenge (>>1000 Items) wäre der Umstieg auf `VariationElasticSearchSearchRepositoryContract` mit echtem Server-Side-Filter sinnvoll.
+Der `ItemRepositoryContract::search()`-with-Resolver garantiert für die verschachtelten Variation-Sub-Relations **kein** Eager-Loading. Wenn ein Konsument konsistent gefüllte Varianten-Sub-Felder braucht, ist der Umstieg auf `VariationElasticSearchSearchRepositoryContract` (eigene Pagination, `setSearchParams()`) der saubere Weg.
+
+Der externe `by-marking`-Endpoint filtert **nach** dem Plenty-Load im PHP, weil `ItemRepositoryContract::search()` keinen `storeSpecial`-Filter unterstützt. Gleiche Empfehlung: bei wachsender Datenmenge (>>1000 Items) auf das ElasticSearch-Repository umstellen.
 
 ## Hinweise zur Plenty-Sandbox
 
