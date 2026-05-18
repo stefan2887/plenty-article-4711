@@ -8,6 +8,7 @@ use Plenty\Plugin\Http\Response;
 use Plenty\Plugin\ConfigRepository;
 use Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract;
 use Plenty\Modules\Item\Variation\Contracts\VariationSearchRepositoryContract;
+use Plenty\Modules\Item\SalesPrice\Contracts\SalesPriceRepositoryContract;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 
 class ExternalArticleController extends Controller
@@ -17,6 +18,14 @@ class ExternalArticleController extends Controller
 
     const DEFAULT_PER_PAGE = 50;
     const MAX_PER_PAGE     = 200;
+
+    /**
+     * Per-Request-Cache: salesPriceId => currency-String.
+     * Wird in loadArticlePage() vor dem Serialize befüllt und von
+     * serializePrice() konsumiert. Reset bei jedem Request am Anfang
+     * von loadArticlePage(), damit kein Cross-Request-Leak entsteht.
+     */
+    private static $currencyMap = [];
 
     /**
      * Eager-Load-Liste für den Item-Load (Schritt 1).
@@ -55,13 +64,14 @@ class ExternalArticleController extends Controller
         ConfigRepository $config,
         ItemRepositoryContract $itemRepository,
         VariationSearchRepositoryContract $variationRepository,
+        SalesPriceRepositoryContract $salesPriceRepository,
         AuthHelper $authHelper
     ) {
         $authErr = self::requireValidApiKey($request, $response, $config);
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $page, $perPage, $lang);
 
         return $response->json([
             'data'       => $loaded['articles'],
@@ -92,6 +102,7 @@ class ExternalArticleController extends Controller
         ConfigRepository $config,
         ItemRepositoryContract $itemRepository,
         VariationSearchRepositoryContract $variationRepository,
+        SalesPriceRepositoryContract $salesPriceRepository,
         AuthHelper $authHelper,
         int $storeSpecial
     ) {
@@ -99,7 +110,7 @@ class ExternalArticleController extends Controller
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $page, $perPage, $lang);
 
         $filtered = [];
         foreach ($loaded['articles'] as $article) {
@@ -162,10 +173,14 @@ class ExternalArticleController extends Controller
         AuthHelper $authHelper,
         ItemRepositoryContract $itemRepository,
         VariationSearchRepositoryContract $variationRepository,
+        SalesPriceRepositoryContract $salesPriceRepository,
         int $page,
         int $perPage,
         string $lang
     ): array {
+        // Per-Request-Reset des Currency-Caches.
+        self::$currencyMap = [];
+
         // Schritt 1: Items paginieren (Item-Pagination bleibt der Konsumenten-Vertrag).
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
             return $itemRepository->search([], [$lang], $page, $perPage, self::itemRelations());
@@ -185,6 +200,10 @@ class ExternalArticleController extends Controller
 
         // Schritt 2: Variations + Sub-Relations für genau diese Item-IDs holen.
         $variationsByItemId = self::loadVariationsByItemId($authHelper, $variationRepository, $itemIds);
+
+        // Schritt 2b: Currency pro salesPriceId vorladen (Plenty's VariationSalesPrice
+        // hat keine eigene currency — die haengt am SalesPrice-Parent).
+        self::$currencyMap = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
 
         // Schritt 3: serialize, jeweils mit den passenden Varianten angereichert.
         $articles = [];
@@ -216,6 +235,58 @@ class ExternalArticleController extends Controller
                 'has_next_page'  => $isLastPage === null ? null : ! $isLastPage,
             ],
         ];
+    }
+
+    /**
+     * Sammelt einzigartige salesPriceIds aus den geladenen Variations, lädt
+     * die zugehörigen SalesPrice-Parents via SalesPriceRepositoryContract und
+     * liefert eine Map id => currency-String.
+     *
+     * Plenty's VariationSalesPrice hat keine eigene currency — die haengt am
+     * SalesPrice-Parent (typisch wenige SalesPrice-Konfigurationen pro Shop,
+     * also N kleine findById-Lookups; nicht eskalierend mit der Item-Anzahl).
+     */
+    private static function loadCurrencyMap(
+        AuthHelper $authHelper,
+        SalesPriceRepositoryContract $salesPriceRepository,
+        array $variationsByItemId
+    ): array {
+        $uniqueIds = [];
+        foreach ($variationsByItemId as $variationList) {
+            foreach ($variationList as $v) {
+                $prices = self::prop($v, 'variationSalesPrices');
+                if (!is_array($prices) && !is_object($prices)) continue;
+                foreach ($prices as $p) {
+                    $id = self::asInt(self::prop($p, 'salesPriceId'));
+                    if ($id !== null) $uniqueIds[$id] = true;
+                }
+            }
+        }
+        if (empty($uniqueIds)) {
+            return [];
+        }
+
+        $rawSalesPrices = $authHelper->processUnguarded(function () use ($salesPriceRepository, $uniqueIds) {
+            $raw = [];
+            foreach (array_keys($uniqueIds) as $id) {
+                $sp = $salesPriceRepository->findById($id);
+                if ($sp !== null) {
+                    $raw[$id] = $sp;
+                }
+            }
+            return $raw;
+        });
+
+        $byId = [];
+        if (is_array($rawSalesPrices)) {
+            foreach ($rawSalesPrices as $id => $sp) {
+                $currency = self::prop($sp, 'currency');
+                if (is_string($currency) && $currency !== '') {
+                    $byId[(int) $id] = $currency;
+                }
+            }
+        }
+        return $byId;
     }
 
     /**
@@ -576,10 +647,14 @@ class ExternalArticleController extends Controller
 
     private static function serializePrice($p): array
     {
+        $salesPriceId = self::asInt(self::prop($p, 'salesPriceId'));
+        $currency = ($salesPriceId !== null && isset(self::$currencyMap[$salesPriceId]))
+            ? self::$currencyMap[$salesPriceId]
+            : null;
         return [
-            'sales_price_id' => self::asInt(self::prop($p, 'salesPriceId')),
+            'sales_price_id' => $salesPriceId,
             'price'          => self::asFloat(self::prop($p, 'price')),
-            'currency'       => self::asString(self::prop($p, 'currency')),
+            'currency'       => $currency,
             'updated_at'     => self::asIsoDate(self::prop($p, 'updatedAt')),
         ];
     }
