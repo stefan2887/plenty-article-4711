@@ -7,6 +7,7 @@ use Plenty\Plugin\Http\Request;
 use Plenty\Plugin\Http\Response;
 use Plenty\Plugin\ConfigRepository;
 use Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract;
+use Plenty\Modules\Item\Variation\Contracts\VariationSearchRepositoryContract;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 
 class ExternalArticleController extends Controller
@@ -18,26 +19,33 @@ class ExternalArticleController extends Controller
     const MAX_PER_PAGE     = 200;
 
     /**
-     * Eager-Load-Liste für ItemRepositoryContract::search().
-     * Punkt-Notation für Sub-Relations der Variations — wenn der Plenty-with-Resolver
-     * die nicht eager auflöst, kommen die Sub-Felder im Response als leere Arrays
-     * (kein Crash); siehe README ("Datenquelle").
+     * Eager-Load-Liste für den Item-Load (Schritt 1).
+     * Variations werden separat in Schritt 2 via VariationSearchRepositoryContract
+     * geladen, weil der Item-Repo-Resolver für viele Sub-Relations (Preise,
+     * Properties, Markets) ignoriert eager wird.
      */
-    private static function relations(): array
+    private static function itemRelations(): array
+    {
+        return ['texts', 'itemImages'];
+    }
+
+    /**
+     * Eager-Load-Map für den Variation-Load (Schritt 2).
+     * VariationSearchRepositoryContract erwartet die with-Map als
+     * assoziatives Array (Key=Relation, Value=null|sub-with-spec).
+     */
+    private static function variationRelations(): array
     {
         return [
-            'texts',
-            'itemImages',
-            'variations',
-            'variations.variationSalesPrices',
-            'variations.variationBarcodes',
-            'variations.variationCategories',
-            'variations.variationClients',
-            'variations.variationMarkets',
-            'variations.variationProperties',
-            'variations.variationAttributeValues',
-            'variations.unit',
-            'variations.stock',
+            'variationSalesPrices'     => null,
+            'variationProperties'      => null,
+            'variationBarcodes'        => null,
+            'variationCategories'      => null,
+            'variationClients'         => null,
+            'variationMarkets'         => null,
+            'variationAttributeValues' => null,
+            'unit'                     => null,
+            'stock'                    => null,
         ];
     }
 
@@ -46,21 +54,23 @@ class ExternalArticleController extends Controller
         Response $response,
         ConfigRepository $config,
         ItemRepositoryContract $itemRepository,
+        VariationSearchRepositoryContract $variationRepository,
         AuthHelper $authHelper
     ) {
         $authErr = self::requireValidApiKey($request, $response, $config);
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $page, $perPage, $lang);
 
         return $response->json([
             'data'       => $loaded['articles'],
             'pagination' => $loaded['pagination'],
             'meta'       => self::baseMeta($request) + [
-                'lang'           => $lang,
-                'with'           => self::relations(),
-                'schema_version' => self::SCHEMA_VERSION,
+                'lang'                 => $lang,
+                'with_item'            => self::itemRelations(),
+                'with_variation'       => array_keys(self::variationRelations()),
+                'schema_version'       => self::SCHEMA_VERSION,
             ],
         ], 200);
     }
@@ -81,6 +91,7 @@ class ExternalArticleController extends Controller
         Response $response,
         ConfigRepository $config,
         ItemRepositoryContract $itemRepository,
+        VariationSearchRepositoryContract $variationRepository,
         AuthHelper $authHelper,
         int $storeSpecial
     ) {
@@ -88,7 +99,7 @@ class ExternalArticleController extends Controller
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $page, $perPage, $lang);
 
         $filtered = [];
         foreach ($loaded['articles'] as $article) {
@@ -107,10 +118,11 @@ class ExternalArticleController extends Controller
                 'store_special' => $storeSpecial,
             ],
             'meta'       => self::baseMeta($request) + [
-                'lang'           => $lang,
-                'with'           => self::relations(),
-                'filter_applied' => 'post_load_php',
-                'schema_version' => self::SCHEMA_VERSION,
+                'lang'                 => $lang,
+                'with_item'            => self::itemRelations(),
+                'with_variation'       => array_keys(self::variationRelations()),
+                'filter_applied'       => 'post_load_php',
+                'schema_version'       => self::SCHEMA_VERSION,
             ],
         ], 200);
     }
@@ -149,21 +161,37 @@ class ExternalArticleController extends Controller
     private static function loadArticlePage(
         AuthHelper $authHelper,
         ItemRepositoryContract $itemRepository,
+        VariationSearchRepositoryContract $variationRepository,
         int $page,
         int $perPage,
         string $lang
     ): array {
+        // Schritt 1: Items paginieren (Item-Pagination bleibt der Konsumenten-Vertrag).
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
-            return $itemRepository->search([], [$lang], $page, $perPage, self::relations());
+            return $itemRepository->search([], [$lang], $page, $perPage, self::itemRelations());
         });
 
         $entries = $paginated->getResult();
 
-        $articles = [];
+        $items   = [];
+        $itemIds = [];
         if (is_array($entries) || is_object($entries)) {
             foreach ($entries as $item) {
-                $articles[] = self::serializeArticle($item, $lang);
+                $items[] = $item;
+                $id = self::asInt(self::pick($item, 'id'));
+                if ($id !== null) $itemIds[] = $id;
             }
+        }
+
+        // Schritt 2: Variations + Sub-Relations für genau diese Item-IDs holen.
+        $variationsByItemId = self::loadVariationsByItemId($authHelper, $variationRepository, $itemIds);
+
+        // Schritt 3: serialize, jeweils mit den passenden Varianten angereichert.
+        $articles = [];
+        foreach ($items as $item) {
+            $itemId = self::asInt(self::pick($item, 'id'));
+            $vars   = ($itemId !== null && isset($variationsByItemId[$itemId])) ? $variationsByItemId[$itemId] : [];
+            $articles[] = self::serializeArticle($item, $lang, $vars);
         }
 
         $totalCount  = null;
@@ -191,11 +219,48 @@ class ExternalArticleController extends Controller
     }
 
     /**
+     * Lädt alle Varianten für eine Liste von Item-IDs und gruppiert sie nach itemId.
+     * Genau ein Variation-Repo-Call pro Item-Seite — Sub-Relations werden zuverlässig
+     * eager geladen, weil der VariationSearchRepository-Resolver mehr Relations
+     * unterstützt als ItemRepositoryContract::search().
+     */
+    private static function loadVariationsByItemId(
+        AuthHelper $authHelper,
+        VariationSearchRepositoryContract $variationRepository,
+        array $itemIds
+    ): array {
+        if (empty($itemIds)) {
+            return [];
+        }
+
+        $rawVariations = $authHelper->processUnguarded(function () use ($variationRepository, $itemIds) {
+            $variationRepository->setSearchParams([
+                'with' => self::variationRelations(),
+            ]);
+            $result = $variationRepository->search(['itemIds' => $itemIds]);
+            return $result->getResult();
+        });
+
+        $byItemId = [];
+        if (is_array($rawVariations) || is_object($rawVariations)) {
+            foreach ($rawVariations as $v) {
+                $itemId = self::asInt(self::prop($v, 'itemId'));
+                if ($itemId === null) continue;
+                if (!isset($byItemId[$itemId])) {
+                    $byItemId[$itemId] = [];
+                }
+                $byItemId[$itemId][] = $v;
+            }
+        }
+        return $byItemId;
+    }
+
+    /**
      * Wandelt ein Plenty-Item (Array oder Objekt) in das Export-Schema.
      * Sandbox-konform: nur is_*, isset, get_class, kein method_exists,
      * keine dynamischen Property-Namen.
      */
-    private static function serializeArticle($item, string $lang): array
+    private static function serializeArticle($item, string $lang, array $preloadedVariations = []): array
     {
         return [
             'id'               => self::asInt(self::pick($item, 'id')),
@@ -208,7 +273,7 @@ class ExternalArticleController extends Controller
             'texts_by_lang'    => self::extractTextsByLang($item),
             'primary_name'     => self::primaryName($item, $lang),
             'images'           => self::extractImages($item),
-            'variations'       => self::extractVariations($item),
+            'variations'       => self::serializeVariationList($preloadedVariations),
         ];
     }
 
@@ -229,7 +294,6 @@ class ExternalArticleController extends Controller
                 case 'updatedAt':       return isset($item->updatedAt)       ? $item->updatedAt       : null;
                 case 'texts':           return isset($item->texts)           ? $item->texts           : null;
                 case 'itemImages':      return isset($item->itemImages)      ? $item->itemImages      : null;
-                case 'variations':      return isset($item->variations)      ? $item->variations      : null;
             }
         }
         return null;
@@ -388,13 +452,13 @@ class ExternalArticleController extends Controller
     // "es gibt keine".
     // ------------------------------------------------------------------
 
-    private static function extractVariations($item): array
+    /**
+     * Serialisiert die in loadVariationsByItemId() vorab geladene Varianten-Liste.
+     * Anders als die früheren extract*-Methoden picken wir hier nicht aus dem Item,
+     * sondern bekommen die schon korrekt geladenen Variation-Objekte direkt rein.
+     */
+    private static function serializeVariationList(array $variations): array
     {
-        $variations = self::pick($item, 'variations');
-        if ($variations === null || (!is_array($variations) && !is_object($variations))) {
-            return [];
-        }
-
         $out = [];
         foreach ($variations as $v) {
             $out[] = self::serializeVariation($v);

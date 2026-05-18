@@ -144,13 +144,20 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
     "fetched_at": "2026-04-29T14:32:00+00:00",
     "endpoint": "/rest/article-list-4711/external/articles",
     "lang": "de",
-    "with": ["texts", "itemImages", "variations", "variations.variationSalesPrices", "..."],
+    "with_item":      ["texts", "itemImages"],
+    "with_variation": ["variationSalesPrices", "variationProperties", "variationBarcodes",
+                       "variationCategories", "variationClients", "variationMarkets",
+                       "variationAttributeValues", "unit", "stock"],
     "schema_version": "1"
   }
 }
 ```
 
-**Hinweis zu `variations[].*` Sub-Feldern:** Plenty's `ItemRepositoryContract::search()` löst die Punkt-Notation für verschachtelte Variation-Relations (Preise, Stock, Properties, etc.) nicht garantiert eager auf. Wenn ein Sub-Array leer (`[]`) ankommt, heißt das **"nicht geladen"**, nicht "es gibt keine Daten". Bei Bedarf: über `VariationElasticSearchSearchRepositoryContract` mit eigenem `setSearchParams()` umstellen — siehe „Datenquelle".
+**Wie Variations geladen werden (seit v1.9.0):** Items und Variations kommen aus zwei getrennten Plenty-Repos:
+1. **Items** über `ItemRepositoryContract::search()` mit minimalem with (`texts`, `itemImages`) — das definiert die Pagination (`page`/`per_page` = Items).
+2. **Variations** für die geladenen Item-IDs über `VariationSearchRepositoryContract::search(['itemIds' => …])` mit vollem with (Preise, Properties, Barcodes, Kategorien, etc.).
+
+Pro Request also genau zwei Plenty-API-Calls. Vorteil: das Variation-Repo löst die Sub-Relations zuverlässig eager auf, anders als das Item-Repo. Konsumenten-Vertrag (`page`/`per_page`/`has_next_page`) bleibt item-basiert wie zuvor.
 
 Bei `by-marking` kommen zwei zusätzliche Felder dazu — alles andere ist identisch:
 
@@ -211,11 +218,15 @@ resources/views/ArticleList.twig                       HTML-Tabelle für die Twi
 
 ## Datenquelle
 
-`Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], [$lang], $page, $perPage, $relations)` in `AuthHelper::processUnguarded`. Die `$relations` werden zentral in `ExternalArticleController::relations()` gepflegt und umfassen `texts`, `itemImages`, `variations` plus Punkt-Notation für Variations-Sub-Relations (`variations.variationSalesPrices`, `variations.stock`, `variations.variationBarcodes`, `variations.variationCategories`, `variations.variationProperties`, `variations.variationClients`, `variations.variationMarkets`, `variations.unit`, `variations.variationAttributeValues`).
+Zwei Plenty-Repos, ein Request:
 
-Der `ItemRepositoryContract::search()`-with-Resolver garantiert für die verschachtelten Variation-Sub-Relations **kein** Eager-Loading. Wenn ein Konsument konsistent gefüllte Varianten-Sub-Felder braucht, ist der Umstieg auf `VariationElasticSearchSearchRepositoryContract` (eigene Pagination, `setSearchParams()`) der saubere Weg.
+1. **`Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract::search([], [$lang], $page, $perPage, ['texts','itemImages'])`** — paginiert Items, lädt die Texte und Bilder eager. Pagination-Vertrag (`page`/`per_page`) ist item-basiert und bleibt stabil. Konfiguriert in `ExternalArticleController::itemRelations()`.
 
-Der externe `by-marking`-Endpoint filtert **nach** dem Plenty-Load im PHP, weil `ItemRepositoryContract::search()` keinen `storeSpecial`-Filter unterstützt. Gleiche Empfehlung: bei wachsender Datenmenge (>>1000 Items) auf das ElasticSearch-Repository umstellen.
+2. **`Plenty\Modules\Item\Variation\Contracts\VariationSearchRepositoryContract`** — bekommt die in Schritt 1 geladenen `itemIds` als Filter und lädt für genau diese Items alle Variations + Sub-Relations (Preise, Properties, Barcodes, Kategorien, Clients, Markets, Unit, Stock, AttributeValues). Konfiguriert in `ExternalArticleController::variationRelations()`. Hintergrund: Plenty's Item-Repo löst die Variation-Sub-Relations über `variations.*`-Punkt-Notation nur sehr selektiv eager auf (Preise/Properties/Markets blieben in v1.8.0 konsistent leer), das Variation-Repo dagegen ist da zuverlässig.
+
+Beide Calls laufen in `AuthHelper::processUnguarded`, das Ergebnis aus Schritt 2 wird nach `itemId` gruppiert und beim Serialize an `serializeArticle($item, $lang, $preloadedVariations)` durchgereicht.
+
+Der externe `by-marking`-Endpoint filtert **nach** dem Plenty-Load im PHP, weil `ItemRepositoryContract::search()` keinen `storeSpecial`-Filter unterstützt. Bei wachsender Datenmenge (>>1000 Items) wäre der Umstieg auf `VariationElasticSearchSearchRepositoryContract` mit echtem Server-Side-Filter sinnvoll.
 
 ## Hinweise zur Plenty-Sandbox
 
