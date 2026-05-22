@@ -14,7 +14,7 @@ use Plenty\Modules\Authorization\Services\AuthHelper;
 class ExternalArticleController extends Controller
 {
     /** Schema-Version des Response-Envelopes. Erhöhen, wenn sich das Format inkompatibel ändert. */
-    const SCHEMA_VERSION = '1';
+    const SCHEMA_VERSION = '2';
 
     const DEFAULT_PER_PAGE = 50;
     const MAX_PER_PAGE     = 200;
@@ -345,7 +345,68 @@ class ExternalArticleController extends Controller
             'primary_name'     => self::primaryName($item, $lang),
             'images'           => self::extractImages($item),
             'variations'       => self::serializeVariationList($preloadedVariations),
+            'referrer_ids'     => self::mainVariationReferrerIds($preloadedVariations),
         ];
+    }
+
+    /**
+     * Liefert die einzigartigen Plenty-Referrer-IDs (Herkünfte) **der
+     * Hauptvariante** (`isMain == true`). Plenty garantiert genau eine
+     * Hauptvariante pro Item; ohne markierte Hauptvariante kommt ein leeres
+     * Array zurück (statt einer Aggregation über die Nicht-Haupt-Variations).
+     *
+     * Plenty-Referrer-IDs sind Floats im Major.Minor-Format (z. B. `11.04` für
+     * den TikTok/Krupsid-Sub-Channel). In JSON/PHP-Float-Form sind sie fragil:
+     * `11.04` kann als `11.040000000000001` serialisieren, `11.10` verliert die
+     * `0` und wird `11.1` — beides ändert die effektive Herkunft. Deshalb
+     * konsumiert dieser Export Referrer-IDs als String und behält die
+     * Originaldarstellung von Plenty bei.
+     */
+    private static function mainVariationReferrerIds(array $variations): array
+    {
+        $seen = [];
+        $out  = [];
+        foreach ($variations as $v) {
+            if (self::asBool(self::prop($v, 'isMain')) !== true) continue;
+            $markets = self::prop($v, 'variationMarkets');
+            if (!self::isIterable_($markets)) continue;
+            foreach ($markets as $m) {
+                $id = self::referrerIdString(self::prop($m, 'marketId'));
+                if ($id === null) continue;
+                if (isset($seen[$id])) continue;
+                $seen[$id] = true;
+                $out[] = $id;
+            }
+            // Plenty: genau eine Hauptvariante pro Item — weitere Iterationen
+            // sind nicht nötig (und würden bei Datenbug stillschweigend mischen).
+            break;
+        }
+        return $out;
+    }
+
+    /**
+     * Normalisiert einen Plenty-Referrer-Wert in seine String-Repräsentation.
+     * Strings werden 1:1 durchgereicht (Plenty liefert oft schon "11.04");
+     * numerische Werte werden ohne Locale-Fallstricke formatiert.
+     */
+    private static function referrerIdString($v): ?string
+    {
+        if ($v === null || $v === '') return null;
+        if (is_string($v)) return $v;
+        if (is_int($v))    return (string) $v;
+        if (is_float($v)) {
+            // number_format mit ausreichender Präzision, dann Trailing-Cleanup
+            // — aber nur trailing zeros nach dem Dezimalpunkt entfernen, nicht
+            // signifikante Stellen. "11.040" → "11.04", "11.00" → "11".
+            $s = number_format($v, 6, '.', '');
+            if (strpos($s, '.') !== false) {
+                $s = rtrim($s, '0');
+                $s = rtrim($s, '.');
+            }
+            return $s;
+        }
+        if (is_numeric($v)) return (string) $v;
+        return null;
     }
 
     private static function pick($item, string $key)
@@ -710,8 +771,14 @@ class ExternalArticleController extends Controller
 
     private static function serializeMarket($m): array
     {
+        // marketId IST in Plenty die Referrer-ID/Herkunft (Float-Format
+        // Major.Minor, z. B. 11.04 = TikTok-Sub-Channel). Beide Keys liefern
+        // denselben Wert als String — `market_id` für API-Konsistenz mit der
+        // Plenty-Terminologie, `referrer_id` als klarer Semantik-Alias.
+        $referrerId = self::referrerIdString(self::prop($m, 'marketId'));
         return [
-            'market_id'   => self::asInt(self::prop($m, 'marketId')),
+            'market_id'   => $referrerId,
+            'referrer_id' => $referrerId,
             'sku'         => self::asString(self::prop($m, 'sku')),
             'initial_sku' => self::asString(self::prop($m, 'initialSku')),
         ];
