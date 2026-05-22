@@ -9,12 +9,13 @@ use Plenty\Plugin\ConfigRepository;
 use Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract;
 use Plenty\Modules\Item\Variation\Contracts\VariationSearchRepositoryContract;
 use Plenty\Modules\Item\SalesPrice\Contracts\SalesPriceRepositoryContract;
+use Plenty\Modules\Order\Referrer\Contracts\OrderReferrerRepositoryContract;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 
 class ExternalArticleController extends Controller
 {
     /** Schema-Version des Response-Envelopes. Erhöhen, wenn sich das Format inkompatibel ändert. */
-    const SCHEMA_VERSION = '2';
+    const SCHEMA_VERSION = '3';
 
     const DEFAULT_PER_PAGE = 50;
     const MAX_PER_PAGE     = 200;
@@ -26,6 +27,14 @@ class ExternalArticleController extends Controller
      * von loadArticlePage(), damit kein Cross-Request-Leak entsteht.
      */
     private static $currencyMap = [];
+
+    /**
+     * Per-Request-Cache: referrer-id-String => ['name' => ?string, 'backend_name' => ?string].
+     * Befüllt aus OrderReferrerRepositoryContract::getList(); benutzt von
+     * serializeMarket() und mainVariationReferrers(). Reset am Anfang von
+     * loadArticlePage(), siehe $currencyMap.
+     */
+    private static $referrerMap = [];
 
     /**
      * Eager-Load-Liste für den Item-Load (Schritt 1).
@@ -65,13 +74,14 @@ class ExternalArticleController extends Controller
         ItemRepositoryContract $itemRepository,
         VariationSearchRepositoryContract $variationRepository,
         SalesPriceRepositoryContract $salesPriceRepository,
+        OrderReferrerRepositoryContract $orderReferrerRepository,
         AuthHelper $authHelper
     ) {
         $authErr = self::requireValidApiKey($request, $response, $config);
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang);
 
         return $response->json([
             'data'       => $loaded['articles'],
@@ -103,6 +113,7 @@ class ExternalArticleController extends Controller
         ItemRepositoryContract $itemRepository,
         VariationSearchRepositoryContract $variationRepository,
         SalesPriceRepositoryContract $salesPriceRepository,
+        OrderReferrerRepositoryContract $orderReferrerRepository,
         AuthHelper $authHelper,
         int $storeSpecial
     ) {
@@ -110,7 +121,7 @@ class ExternalArticleController extends Controller
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang);
 
         $filtered = [];
         foreach ($loaded['articles'] as $article) {
@@ -174,12 +185,14 @@ class ExternalArticleController extends Controller
         ItemRepositoryContract $itemRepository,
         VariationSearchRepositoryContract $variationRepository,
         SalesPriceRepositoryContract $salesPriceRepository,
+        OrderReferrerRepositoryContract $orderReferrerRepository,
         int $page,
         int $perPage,
         string $lang
     ): array {
-        // Per-Request-Reset des Currency-Caches.
+        // Per-Request-Reset der Caches.
         self::$currencyMap = [];
+        self::$referrerMap = [];
 
         // Schritt 1: Items paginieren (Item-Pagination bleibt der Konsumenten-Vertrag).
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
@@ -204,6 +217,10 @@ class ExternalArticleController extends Controller
         // Schritt 2b: Currency pro salesPriceId vorladen (Plenty's VariationSalesPrice
         // hat keine eigene currency — die haengt am SalesPrice-Parent).
         self::$currencyMap = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
+
+        // Schritt 2c: Referrer-Namen vorladen — ein getList()-Call statt
+        // N findById()-Lookups (Shops haben typisch <100 Herkünfte).
+        self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
 
         // Schritt 3: serialize, jeweils mit den passenden Varianten angereichert.
         $articles = [];
@@ -290,6 +307,40 @@ class ExternalArticleController extends Controller
     }
 
     /**
+     * Lädt alle Plenty-Herkünfte (Order Referrer) via OrderReferrerRepositoryContract
+     * einmal pro Request und baut eine Map referrer-id-String => ['name', 'backend_name'].
+     *
+     * Plenty-Referrer-IDs sind Floats (z. B. `11.04`). Die Map ist nach String-
+     * Repräsentation gekeyed, damit sie zum identisch normalisierten `referrer_id`-
+     * String aus serializeMarket() passt — kein Float-Equality-Vergleich nötig.
+     *
+     * Ein einzelner getList() ist günstiger als per-ID-Lookups: Shops haben typisch
+     * deutlich unter 100 konfigurierten Referrer-Einträgen, also kleines Response,
+     * und N Items × M Markets würden sonst potentiell viele Roundtrips kosten.
+     */
+    private static function loadReferrerMap(
+        AuthHelper $authHelper,
+        OrderReferrerRepositoryContract $orderReferrerRepository
+    ): array {
+        $referrers = $authHelper->processUnguarded(function () use ($orderReferrerRepository) {
+            return $orderReferrerRepository->getList();
+        });
+
+        $map = [];
+        if (is_array($referrers) || is_object($referrers)) {
+            foreach ($referrers as $r) {
+                $id = self::referrerIdString(self::prop($r, 'id'));
+                if ($id === null) continue;
+                $map[$id] = [
+                    'name'         => self::asString(self::prop($r, 'name')),
+                    'backend_name' => self::asString(self::prop($r, 'backendName')),
+                ];
+            }
+        }
+        return $map;
+    }
+
+    /**
      * Lädt alle Varianten für eine Liste von Item-IDs und gruppiert sie nach itemId.
      * Genau ein Variation-Repo-Call pro Item-Seite — Sub-Relations werden zuverlässig
      * eager geladen, weil der VariationSearchRepository-Resolver mehr Relations
@@ -345,15 +396,17 @@ class ExternalArticleController extends Controller
             'primary_name'     => self::primaryName($item, $lang),
             'images'           => self::extractImages($item),
             'variations'       => self::serializeVariationList($preloadedVariations),
-            'referrer_ids'     => self::mainVariationReferrerIds($preloadedVariations),
+            'referrers'        => self::mainVariationReferrers($preloadedVariations),
         ];
     }
 
     /**
-     * Liefert die einzigartigen Plenty-Referrer-IDs (Herkünfte) **der
-     * Hauptvariante** (`isMain == true`). Plenty garantiert genau eine
-     * Hauptvariante pro Item; ohne markierte Hauptvariante kommt ein leeres
-     * Array zurück (statt einer Aggregation über die Nicht-Haupt-Variations).
+     * Liefert die einzigartigen Plenty-Herkünfte **der Hauptvariante**
+     * (`isMain == true`) jeweils mit `id`, `name`, `backend_name`.
+     *
+     * Plenty garantiert genau eine Hauptvariante pro Item; ohne markierte
+     * Hauptvariante kommt ein leeres Array zurück (statt einer Aggregation
+     * über die Nicht-Haupt-Variations).
      *
      * Plenty-Referrer-IDs sind Floats im Major.Minor-Format (z. B. `11.04` für
      * den TikTok/Krupsid-Sub-Channel). In JSON/PHP-Float-Form sind sie fragil:
@@ -361,8 +414,11 @@ class ExternalArticleController extends Controller
      * `0` und wird `11.1` — beides ändert die effektive Herkunft. Deshalb
      * konsumiert dieser Export Referrer-IDs als String und behält die
      * Originaldarstellung von Plenty bei.
+     *
+     * Namen kommen aus `$referrerMap` (vorgeladen via OrderReferrerRepositoryContract
+     * in loadArticlePage()). Unbekannte IDs liefern `name`/`backend_name` als `null`.
      */
-    private static function mainVariationReferrerIds(array $variations): array
+    private static function mainVariationReferrers(array $variations): array
     {
         $seen = [];
         $out  = [];
@@ -375,7 +431,14 @@ class ExternalArticleController extends Controller
                 if ($id === null) continue;
                 if (isset($seen[$id])) continue;
                 $seen[$id] = true;
-                $out[] = $id;
+                $info = isset(self::$referrerMap[$id])
+                    ? self::$referrerMap[$id]
+                    : ['name' => null, 'backend_name' => null];
+                $out[] = [
+                    'id'           => $id,
+                    'name'         => $info['name'],
+                    'backend_name' => $info['backend_name'],
+                ];
             }
             // Plenty: genau eine Hauptvariante pro Item — weitere Iterationen
             // sind nicht nötig (und würden bei Datenbug stillschweigend mischen).
@@ -776,11 +839,16 @@ class ExternalArticleController extends Controller
         // denselben Wert als String — `market_id` für API-Konsistenz mit der
         // Plenty-Terminologie, `referrer_id` als klarer Semantik-Alias.
         $referrerId = self::referrerIdString(self::prop($m, 'marketId'));
+        $info       = ($referrerId !== null && isset(self::$referrerMap[$referrerId]))
+            ? self::$referrerMap[$referrerId]
+            : ['name' => null, 'backend_name' => null];
         return [
-            'market_id'   => $referrerId,
-            'referrer_id' => $referrerId,
-            'sku'         => self::asString(self::prop($m, 'sku')),
-            'initial_sku' => self::asString(self::prop($m, 'initialSku')),
+            'market_id'             => $referrerId,
+            'referrer_id'           => $referrerId,
+            'referrer_name'         => $info['name'],
+            'referrer_backend_name' => $info['backend_name'],
+            'sku'                   => self::asString(self::prop($m, 'sku')),
+            'initial_sku'           => self::asString(self::prop($m, 'initialSku')),
         ];
     }
 
@@ -885,6 +953,9 @@ class ExternalArticleController extends Controller
             // AttributeValue
             case 'attributeId':                 return isset($obj->attributeId)                 ? $obj->attributeId                 : null;
             case 'attributeValueId':            return isset($obj->attributeValueId)            ? $obj->attributeValueId            : null;
+            // OrderReferrer
+            case 'name':                        return isset($obj->name)                        ? $obj->name                        : null;
+            case 'backendName':                 return isset($obj->backendName)                 ? $obj->backendName                 : null;
         }
         return null;
     }

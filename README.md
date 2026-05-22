@@ -124,12 +124,12 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
           "categories": [{ "category_id": 12, "plenty_id": 0, "position": 0, "is_default": true }],
           "properties": [{ "property_id": 5, "value_int": null, "value_float": null, "value_string": "Edelstahl", "value_selection": null, "surcharge": null }],
           "clients":    [{ "plenty_id": 0 }],
-          "markets":    [{ "market_id": "11.04", "referrer_id": "11.04", "sku": "...", "initial_sku": "..." }],
+          "markets":    [{ "market_id": "11.04", "referrer_id": "11.04", "referrer_name": "tiktok", "referrer_backend_name": "TikTok Krupsid", "sku": "...", "initial_sku": "..." }],
           "attribute_values": [{ "attribute_id": 1, "attribute_value_id": 7 }],
           "unit": { "unit_id": 1, "content": 1.0 }
         }
       ],
-      "referrer_ids": ["11.04"]
+      "referrers": [{ "id": "11.04", "name": "tiktok", "backend_name": "TikTok Krupsid" }]
     }
   ],
   "pagination": {
@@ -149,7 +149,7 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
     "with_variation": ["variationSalesPrices", "variationProperties", "variationBarcodes",
                        "variationCategories", "variationClients", "variationMarkets",
                        "variationAttributeValues", "unit", "stock"],
-    "schema_version": "2"
+    "schema_version": "3"
   }
 }
 ```
