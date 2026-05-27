@@ -37,5 +37,11 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'article-list-4711/external/articles/by-marking/{storeSpecial}',
             'ArticleList4711\Controllers\ExternalArticleController@byMarking'
         );
+
+        // Externer POST-Endpoint zum Anlegen einer Plenty-Bestellung.
+        $apiRouter->post(
+            'article-list-4711/external/orders',
+            'ArticleList4711\Controllers\ExternalOrderController@create'
+        );
     }
 }

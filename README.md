@@ -200,17 +200,150 @@ Stabilitätsgarantien:
 - Felder, die unbekannt/leer sind, sind explizit `null` (statt zu fehlen).
 - Schema-Inkrement (`schema_version`) bei brechenden Änderungen. Additive Felder (neue Keys in `data[]` oder `meta`) sind kein Inkrement-Anlass — der Konsument sollte unbekannte Keys tolerant ignorieren.
 
+## Externer Order-Endpoint (POST)
+
+Anlage einer Plenty-Bestellung aus externem System (Shop, Marketplace, ERP).
+
+**Route:** `POST /rest/article-list-4711/external/orders`
+**Auth:** `X-Api-Key` (gleicher Key wie beim Artikel-Export)
+**Content-Type:** `application/json`
+
+**Plenty vergibt alle neuen IDs selbst** — Caller schickt keine Plenty-Order-, Address- oder Payment-IDs mit. Plenty-Konfigurations-IDs (plenty_id, status_id, payment_method_id, …) muss der Caller kennen oder die Plugin-Defaults aus der Konfiguration greifen lassen (siehe Tab *Order-Defaults*).
+
+**Idempotency:** Wenn der Caller `external_order_id` mitschickt, prüft das Plugin via `OrderRepositoryContract::findOrderByExternalOrderId()` vor dem Anlegen. Bei Treffer wird die bestehende Order zurückgegeben (`created: false`), ohne eine zweite anzulegen. Ohne `external_order_id` legt jeder POST eine neue Order an — Duplikat-Schutz liegt beim Caller.
+
+**Request-Body:**
+
+```json
+{
+  "external_order_id": "shop-12345",
+  "referrer_id": 11.04,
+  "plenty_id": 1,
+  "status_id": 5.0,
+  "type_id": 1,
+  "owner_id": 0,
+  "warehouse_id": 104,
+  "shipping_profile_id": 6,
+  "customer_sign": "TikTok-Order",
+  "items": [
+    {
+      "variation_id": 1234,
+      "quantity": 2,
+      "unit_price": 19.99,
+      "vat_rate": 19,
+      "country_vat_id": 1,
+      "vat_field": 0,
+      "currency": "EUR",
+      "name": "Produktname"
+    }
+  ],
+  "billing_address": {
+    "gender": "male",
+    "company": "",
+    "first_name": "Max",
+    "last_name": "Mustermann",
+    "street": "Musterstraße",
+    "house_no": "1",
+    "address_addition": "",
+    "postal_code": "12345",
+    "town": "Musterstadt",
+    "country_id": 1,
+    "state_id": null,
+    "email": "max@example.com",
+    "phone": "0123456789"
+  },
+  "shipping_address": { "...wie billing_address..." },
+  "payment": {
+    "method_id": 1,
+    "amount": 39.98,
+    "currency": "EUR",
+    "status": 2,
+    "transaction_type": 2,
+    "transaction_id": "tx-abc-123",
+    "received_at": "2026-05-22T10:00:00+00:00"
+  }
+}
+```
+
+**Pflichtfelder:** `items[]` (mind. 1, mit `variation_id`, `quantity`, `unit_price`), `billing_address` (`first_name`, `last_name`, `street`, `house_no`, `postal_code`, `town`, `country_id`).
+
+**Optional:** `external_order_id` (empfohlen für Idempotency), `shipping_address` (fällt sonst auf `billing_address` zurück), `payment` (Payment-Anlage + Verknüpfung zur Order), `warehouse_id` / `shipping_profile_id` / `customer_sign` (werden als Plenty-Order-Properties abgelegt), alle Plenty-Config-IDs (Defaults aus Plugin-Config).
+
+**Response (Erfolg, HTTP 201):**
+
+```json
+{
+  "created": true,
+  "order": {
+    "plenty_order_id": 4711,
+    "external_order_id": "shop-12345",
+    "billing_address_id": 9999,
+    "shipping_address_id": 9999,
+    "payment_id": 1234
+  },
+  "meta": {
+    "fetched_at": "2026-05-22T14:32:00+00:00",
+    "endpoint": "/rest/article-list-4711/external/orders",
+    "schema_version": "1"
+  }
+}
+```
+
+**Response (Duplikat, HTTP 200):**
+
+```json
+{
+  "created": false,
+  "reason": "duplicate_external_order_id",
+  "order": { "plenty_order_id": 4711, "external_order_id": "shop-12345" },
+  "meta": { "..." : "..." }
+}
+```
+
+**Response (Validation-Fehler, HTTP 422):**
+
+```json
+{ "error": { "code": "validation_failed", "message": "items[0].variation_id fehlt." } }
+```
+
+**Response (Plenty-Fehler beim Anlegen, HTTP 500):**
+
+```json
+{ "error": { "code": "order_create_failed", "message": "<Plenty-Exception-Text>" } }
+```
+
+**Teil-Erfolg (Order angelegt, Payment fehlgeschlagen, HTTP 201):** Die Order bleibt — das Payment-Failure landet in `warnings[]`, der Caller kann den Payment-POST später nachholen.
+
+**Plenty-IDs, die der Caller kennen muss** (oder per Plugin-Default vorbelegt):
+- `plenty_id` — Plenty-Mandanten-ID (typisch `1`)
+- `status_id` — Order-Status (`5.0` = Freigegeben in Plenty-Default; bei Custom-Status-Config im Backend prüfen)
+- `referrer_id` — Herkunft, Float (`1` = Webshop, `11.04` = Custom-Channel). **Gleicher ID-Raum wie `variationMarkets.marketId` im Artikel-Export.**
+- `country_id` — ISO-Plenty-Land-ID (1 = DE, 2 = AT, …)
+- `payment.method_id` — Plenty-Zahlungsart-ID (1 = Vorkasse, 2 = Nachnahme, …; shop-spezifisch konfiguriert)
+- `payment.status` — 2 = Captured/Bezahlt, 1 = Pending, …
+- `warehouse_id`, `shipping_profile_id` — shop-spezifische IDs
+
+**Plenty-Order-Property-Type-IDs** (Quelle: `Plenty\Modules\Order\Property\Models\OrderPropertyType`):
+| Type | Bedeutung | Plugin-Mapping |
+|---|---|---|
+| 1 | WAREHOUSE | `warehouse_id` |
+| 2 | SHIPPING_PROFILE | `shipping_profile_id` |
+| 3 | PAYMENT_METHOD | `payment.method_id` |
+| 7 | EXTERNAL_ORDER_ID | `external_order_id` |
+| 8 | CUSTOMER_SIGN | `customer_sign` |
+
 ## Aufbau
 
 ```
 plugin.json                                            Plugin-Manifest (type: backend)
-config.json                                            Plugin-Konfiguration (API-Key)
+config.json                                            Plugin-Konfiguration (API-Key, Order-Defaults)
 ui.json                                                Backend-Menüeintrag
 ui/index.html                                          Backend-View (Iframe-Inhalt)
 src/Providers/ArticleList4711ServiceProvider.php       Router + ApiRouter
 src/Controllers/ArticleListController.php              Twig-Route (HTML)
 src/Controllers/ArticleListApiController.php           Backend-REST (JSON, Session-Auth)
-src/Controllers/ExternalArticleController.php          Externer REST (JSON, X-Api-Key)
+src/Controllers/ExternalArticleController.php          Externer Artikel-Export (GET, X-Api-Key)
+src/Controllers/ExternalOrderController.php            Externer Order-Endpoint (POST, X-Api-Key)
 src/Controllers/ArticleListLoader.php                  Geteilter Item-Loader
 resources/views/ArticleList.twig                       HTML-Tabelle für die Twig-Route
 ```

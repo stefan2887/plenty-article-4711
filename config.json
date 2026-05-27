@@ -5,5 +5,33 @@
         "label": "API-Key für externen Zugriff (X-Api-Key Header)",
         "type": "text",
         "default": ""
+    },
+    {
+        "tab": "Order-Defaults",
+        "key": "default_plenty_id",
+        "label": "Default Plenty-Mandanten-ID (plenty_id) für neue Bestellungen",
+        "type": "text",
+        "default": "1"
+    },
+    {
+        "tab": "Order-Defaults",
+        "key": "default_order_status_id",
+        "label": "Default Order-Status-ID (Float, z. B. 5.0 = Freigegeben)",
+        "type": "text",
+        "default": "5.0"
+    },
+    {
+        "tab": "Order-Defaults",
+        "key": "default_order_type_id",
+        "label": "Default Order-Typ-ID (1 = Sales Order)",
+        "type": "text",
+        "default": "1"
+    },
+    {
+        "tab": "Order-Defaults",
+        "key": "default_referrer_id",
+        "label": "Default Referrer-ID/Herkunft (Float, z. B. 1 = Webshop, 11.04 = Custom-Channel)",
+        "type": "text",
+        "default": "1"
     }
 ]
