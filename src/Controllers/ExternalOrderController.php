@@ -182,6 +182,104 @@ class ExternalOrderController extends Controller
         ], 201);
     }
 
+    /**
+     * PUT /rest/article-list-4711/external/orders/{orderId}
+     *
+     * Teil-Update einer bestehenden Plenty-Order. Bewusst eng gehalten:
+     *   - `status_id`            → setzt den Order-Status via updateOrder (partiell,
+     *                              rührt Items/Adressen/Properties nicht an).
+     *   - `payment` / `payments` → legt eine ODER mehrere Zahlungen an und verknüpft
+     *                              sie mit der Order (gleiche Logik wie bei create()).
+     *
+     * NICHT abgedeckt (bewusst): Bestellpositionen ändern und das Mutieren einer
+     * bereits existierenden Zahlung. Neue Zahlungen werden additiv angelegt.
+     *
+     * Idempotenz-Hinweis: Ein erneutes PUT mit demselben `payment` legt eine
+     * ZWEITE Zahlung an. Der Caller sollte je Zahlung eine eindeutige
+     * `transaction_id` mitgeben und nur bei echten Netzwerkfehlern erneut senden.
+     */
+    public function update(
+        Request $request,
+        Response $response,
+        ConfigRepository $config,
+        OrderRepositoryContract $orderRepository,
+        PaymentRepositoryContract $paymentRepository,
+        PaymentOrderRelationRepositoryContract $paymentOrderRelation,
+        AuthHelper $authHelper,
+        int $orderId
+    ) {
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        $payload = self::readJsonBody($request);
+        if (!is_array($payload)) {
+            return self::jsonError($response, $request, 'invalid_body',
+                'Request-Body muss valides JSON-Objekt sein.', 400);
+        }
+
+        $validationErr = self::validateUpdatePayload($payload);
+        if ($validationErr !== null) {
+            return self::jsonError($response, $request, 'validation_failed',
+                $validationErr, 422);
+        }
+
+        // ---- 1. Order muss existieren ------------------------------------
+        $existing = self::findOrderById($authHelper, $orderRepository, $orderId);
+        if ($existing === null) {
+            return self::jsonError($response, $request, 'order_not_found',
+                "Order $orderId existiert nicht.", 404);
+        }
+
+        $applied  = [];
+        $warnings = [];
+
+        // ---- 2. Status-Update --------------------------------------------
+        if (isset($payload['status_id']) && $payload['status_id'] !== '') {
+            $newStatus = (float) $payload['status_id'];
+            try {
+                $authHelper->processUnguarded(function () use ($orderRepository, $orderId, $newStatus) {
+                    return $orderRepository->updateOrder(['statusId' => $newStatus], $orderId);
+                });
+                $applied['status_id'] = $newStatus;
+            } catch (\Throwable $e) {
+                return self::jsonError($response, $request, 'status_update_failed',
+                    'Status-Update in Plenty fehlgeschlagen: ' . $e->getMessage(), 500);
+            }
+        }
+
+        // ---- 3. Zahlungen anlegen + verknüpfen ---------------------------
+        $paymentIds = [];
+        foreach (self::normalizePaymentsInput($payload) as $i => $pay) {
+            try {
+                $paymentIds[] = self::createAndLinkPayment(
+                    $authHelper, $paymentRepository, $paymentOrderRelation, $pay, $orderId
+                );
+            } catch (\Throwable $e) {
+                $warnings[] = [
+                    'code'    => 'payment_create_failed',
+                    'index'   => $i,
+                    'message' => $e->getMessage(),
+                ];
+            }
+        }
+        if (!empty($paymentIds)) {
+            $applied['payment_ids'] = $paymentIds;
+        }
+
+        $result = [
+            'updated' => true,
+            'order'   => [
+                'plenty_order_id' => $orderId,
+                'applied'         => $applied,
+            ],
+            'meta'    => self::baseMeta($request),
+        ];
+        if (!empty($warnings)) {
+            $result['warnings'] = $warnings;
+        }
+        return $response->json($result, 200);
+    }
+
     // ==================================================================
     // Validation
     // ==================================================================
@@ -251,6 +349,53 @@ class ExternalOrderController extends Controller
         return null;
     }
 
+    /**
+     * Validiert den Update-Payload (PUT). Mindestens eines von `status_id`
+     * oder `payment`/`payments` muss vorhanden sein — ein leeres Update wird
+     * abgelehnt, damit ein versehentlich leerer Body nicht still 200 liefert.
+     */
+    private static function validateUpdatePayload(array $p): ?string
+    {
+        $hasStatus = isset($p['status_id']) && $p['status_id'] !== '';
+        $payments  = self::normalizePaymentsInput($p);
+        $hasPayments = !empty($payments);
+
+        if (!$hasStatus && !$hasPayments) {
+            return 'Nichts zu aktualisieren: mindestens `status_id` oder `payment`/`payments` angeben.';
+        }
+        if ($hasStatus && (float) $p['status_id'] <= 0) {
+            return '`status_id` muss > 0 sein.';
+        }
+        foreach ($payments as $i => $pay) {
+            if (!is_array($pay)) {
+                return "payments[$i] ist kein Objekt.";
+            }
+            if (empty($pay['method_id'])) {
+                return "payments[$i].method_id fehlt.";
+            }
+            if (!isset($pay['amount'])) {
+                return "payments[$i].amount fehlt.";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Normalisiert die Zahlungs-Eingabe zu einer Liste. Akzeptiert `payments`
+     * (Array von Objekten) ODER `payment` (Einzelobjekt, wie bei create()).
+     * `payments` hat Vorrang, wenn beide gesetzt sind.
+     */
+    private static function normalizePaymentsInput(array $p): array
+    {
+        if (!empty($p['payments']) && is_array($p['payments'])) {
+            return array_values($p['payments']);
+        }
+        if (!empty($p['payment']) && is_array($p['payment'])) {
+            return [$p['payment']];
+        }
+        return [];
+    }
+
     // ==================================================================
     // Idempotency
     // ==================================================================
@@ -268,6 +413,25 @@ class ExternalOrderController extends Controller
         try {
             return $authHelper->processUnguarded(function () use ($orderRepository, $externalOrderId) {
                 return $orderRepository->findOrderByExternalOrderId($externalOrderId);
+            });
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Lädt eine Order per Plenty-ID. `findOrderById` wirft, wenn keine Order
+     * existiert — wir fangen das ab und liefern `null` für "nicht gefunden",
+     * damit der Update-Endpoint einen sauberen 404 statt eines 500 liefert.
+     */
+    private static function findOrderById(
+        AuthHelper $authHelper,
+        OrderRepositoryContract $orderRepository,
+        int $orderId
+    ) {
+        try {
+            return $authHelper->processUnguarded(function () use ($orderRepository, $orderId) {
+                return $orderRepository->findOrderById($orderId);
             });
         } catch (\Throwable $e) {
             return null;

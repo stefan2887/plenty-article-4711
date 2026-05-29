@@ -332,6 +332,75 @@ Anlage einer Plenty-Bestellung aus externem System (Shop, Marketplace, ERP).
 | 7 | EXTERNAL_ORDER_ID | `external_order_id` |
 | 8 | CUSTOMER_SIGN | `customer_sign` |
 
+## Externer Order-Update-Endpoint (PUT)
+
+Teil-Update einer bestehenden Plenty-Bestellung. Bewusst eng gehalten: **nur Status und Zahlungen** — Bestellpositionen und Adressen werden hier *nicht* geändert.
+
+**Route:** `PUT /rest/article-list-4711/external/orders/{orderId}`
+**Auth:** `X-Api-Key` (gleicher Key wie sonst)
+**Content-Type:** `application/json`
+**`{orderId}`:** die Plenty-Order-ID (`plenty_order_id` aus der Anlage-Response).
+
+**Request-Body** (mindestens eines von `status_id` oder `payment`/`payments`):
+
+```json
+{
+  "status_id": 7.0,
+  "payments": [
+    {
+      "method_id": 1,
+      "amount": 39.98,
+      "currency": "EUR",
+      "status": 2,
+      "transaction_type": 2,
+      "transaction_id": "tx-abc-123",
+      "received_at": "2026-05-29T10:00:00+00:00"
+    }
+  ]
+}
+```
+
+- **`status_id`** (optional) — neuer Order-Status via `OrderRepositoryContract::updateOrder(['statusId' => …], orderId)`. Partielles Update: Items, Adressen und Properties bleiben unangetastet.
+- **`payments`** (optional, Array) **oder** `payment` (optional, Einzelobjekt) — legt je Eintrag eine Zahlung an und verknüpft sie mit der Order (gleiche Logik wie `payment` bei der Anlage). `payments` hat Vorrang, wenn beide gesetzt sind. Pflicht je Zahlung: `method_id`, `amount`.
+
+**Nicht abgedeckt (bewusst):** Bestellpositionen ändern, Adressen ändern, eine *bereits existierende* Zahlung mutieren. Zahlungen werden hier ausschließlich **additiv** angelegt.
+
+**⚠️ Idempotenz:** Ein erneutes PUT mit demselben `payment` legt eine **zweite** Zahlung an. Pro Zahlung eine eindeutige `transaction_id` mitgeben und nur bei echten Netzwerkfehlern erneut senden. Das Status-Update selbst ist idempotent.
+
+**Response (Erfolg, HTTP 200):**
+
+```json
+{
+  "updated": true,
+  "order": {
+    "plenty_order_id": 4711,
+    "applied": {
+      "status_id": 7.0,
+      "payment_ids": [1234]
+    }
+  },
+  "meta": {
+    "fetched_at": "2026-05-29T14:32:00+00:00",
+    "endpoint": "/rest/article-list-4711/external/orders",
+    "schema_version": "1"
+  }
+}
+```
+
+**Response (Order nicht gefunden, HTTP 404):**
+
+```json
+{ "error": { "code": "order_not_found", "message": "Order 4711 existiert nicht." } }
+```
+
+**Response (leeres/ungültiges Update, HTTP 422):**
+
+```json
+{ "error": { "code": "validation_failed", "message": "Nichts zu aktualisieren: mindestens `status_id` oder `payment`/`payments` angeben." } }
+```
+
+**Teil-Erfolg (Status gesetzt, Payment fehlgeschlagen, HTTP 200):** Das Status-Update bleibt bestehen; fehlgeschlagene Zahlungen landen in `warnings[]` (`code: payment_create_failed`, mit `index`), erfolgreiche in `applied.payment_ids`.
+
 ## Aufbau
 
 ```

@@ -43,5 +43,11 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'article-list-4711/external/orders',
             'ArticleList4711\Controllers\ExternalOrderController@create'
         );
+
+        // Externer PUT-Endpoint zum Teil-Update einer Bestellung (Status + Zahlungen).
+        $apiRouter->put(
+            'article-list-4711/external/orders/{orderId}',
+            'ArticleList4711\Controllers\ExternalOrderController@update'
+        );
     }
 }
