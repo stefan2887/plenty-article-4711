@@ -507,7 +507,7 @@ class ExternalOrderController extends Controller
         return is_array($decoded) ? $decoded : null;
     }
 
-    private static function jsonError(Response $response, Request $request, string $code, string $message, int $status): Response
+    private static function jsonError(Response $response, Request $request, string $code, string $message, int $status)
     {
         return $response->json([
             'error' => ['code' => $code, 'message' => $message],

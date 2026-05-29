@@ -5,7 +5,7 @@
     "description": "Plentymarkets-Plugin: Backend-Artikelliste plus externe REST-Endpoints für Artikel-Export (GET) und Order-Anlage (POST)",
     "author": "Stefan Kleebauer",
     "serviceProvider": "ArticleList4711\\Providers\\ArticleList4711ServiceProvider",
-    "version": "1.10.0",
+    "version": "1.10.1",
     "license": "MIT",
     "keywords": ["terra", "backend", "items", "list"],
     "shortDescription": {
