@@ -21,6 +21,19 @@ class ExternalArticleController extends Controller
     const MAX_PER_PAGE     = 200;
 
     /**
+     * Dedizierte Zusatzfelder, die aus generischen Plenty-Strukturen
+     * herausgehoben werden (zusätzlich zur generischen `barcodes[]`/`properties[]`-Liste).
+     *
+     * BARCODE_EAN_ID: Plenty-Barcode-Definition-ID, aus der die EAN gezogen wird.
+     * PROP_TIKTOK_BRAND_ID: Eigenschaft "Marken-ID TikTok" (Texttyp → value_string).
+     * PROP_ELECTRONICS_LABEL: Eigenschaft "Elektrogeräte-Kennzeichnung" (Datei →
+     *   value_string; erwartet einen Link/URL zur PDF).
+     */
+    const BARCODE_EAN_ID         = 1;
+    const PROP_TIKTOK_BRAND_ID   = 121;
+    const PROP_ELECTRONICS_LABEL = 122;
+
+    /**
      * Per-Request-Cache: salesPriceId => currency-String.
      * Wird in loadArticlePage() vor dem Serialize befüllt und von
      * serializePrice() konsumiert. Reset bei jedem Request am Anfang
@@ -696,7 +709,52 @@ class ExternalArticleController extends Controller
             'markets'             => self::extractMarkets(self::prop($v, 'variationMarkets')),
             'attribute_values'    => self::extractAttributeValues(self::prop($v, 'variationAttributeValues')),
             'unit'                => self::serializeUnit(self::prop($v, 'unit')),
+            // Dedizierte Zusatzfelder (aus barcodes[]/properties[] herausgehoben).
+            // `null`, wenn die jeweilige Quelle für diese Variante nicht gesetzt
+            // ist — bzw. wenn die Eigenschaft nicht über `variationProperties`
+            // ausgeliefert wird (dann siehe README → neue Plenty-"Eigenschaften").
+            'ean'                   => self::eanFromBarcodes(self::prop($v, 'variationBarcodes')),
+            'tiktok_brand_id'       => self::propertyTextValue(self::prop($v, 'variationProperties'), self::PROP_TIKTOK_BRAND_ID),
+            'electronics_label_url' => self::propertyTextValue(self::prop($v, 'variationProperties'), self::PROP_ELECTRONICS_LABEL),
         ];
+    }
+
+    /**
+     * Zieht die EAN aus der Barcode-Liste — den `code` des Barcodes mit
+     * barcodeId == BARCODE_EAN_ID. Als String belassen (führende Nullen /
+     * Länge bleiben erhalten). `null`, wenn kein passender Barcode existiert.
+     */
+    private static function eanFromBarcodes($c): ?string
+    {
+        if (!self::isIterable_($c)) return null;
+        foreach ($c as $b) {
+            if (self::asInt(self::prop($b, 'barcodeId')) !== self::BARCODE_EAN_ID) continue;
+            $code = self::asString(self::prop($b, 'code'));
+            if ($code !== null && $code !== '') return $code;
+        }
+        return null;
+    }
+
+    /**
+     * Liefert den Textwert (`valueString`) der Eigenschaft mit der gegebenen
+     * propertyId aus der Variations-Eigenschaftsliste. Bewusst als String —
+     * TikTok-Marken-IDs sind lange numerische Strings, die als Zahl Präzision
+     * verlieren würden; bei der Datei-Eigenschaft steht hier der PDF-Link.
+     *
+     * `null`, wenn die Eigenschaft fehlt oder leer ist. Greift NUR auf die
+     * klassische `variationProperties`-Relation zu; die neuen Plenty-
+     * "Eigenschaften" (Properties 2.0) laufen über eine andere Relation und
+     * würden hier nicht erscheinen (siehe README).
+     */
+    private static function propertyTextValue($c, int $propertyId): ?string
+    {
+        if (!self::isIterable_($c)) return null;
+        foreach ($c as $p) {
+            if (self::asInt(self::prop($p, 'propertyId')) !== $propertyId) continue;
+            $val = self::asString(self::prop($p, 'valueString'));
+            if ($val !== null && $val !== '') return $val;
+        }
+        return null;
     }
 
     /** Gemeinsamer "iterable or empty"-Check für alle Sub-Collections. */

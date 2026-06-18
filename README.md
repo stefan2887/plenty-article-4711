@@ -126,7 +126,10 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
           "clients":    [{ "plenty_id": 0 }],
           "markets":    [{ "market_id": "11.04", "referrer_id": "11.04", "referrer_name": "tiktok", "referrer_backend_name": "TikTok Krupsid", "sku": "...", "initial_sku": "..." }],
           "attribute_values": [{ "attribute_id": 1, "attribute_value_id": 7 }],
-          "unit": { "unit_id": 1, "content": 1.0 }
+          "unit": { "unit_id": 1, "content": 1.0 },
+          "ean": "4006381333933",
+          "tiktok_brand_id": "7300000000000000000",
+          "electronics_label_url": "https://<shop>/.../elektro-kennzeichnung.pdf"
         }
       ],
       "referrers": [{ "id": "11.04", "name": "tiktok", "backend_name": "TikTok Krupsid" }]
@@ -159,6 +162,24 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
 2. **Variations** für die geladenen Item-IDs über `VariationSearchRepositoryContract::search(['itemIds' => …])` mit vollem with (Preise, Properties, Barcodes, Kategorien, etc.).
 
 Pro Request also genau zwei Plenty-API-Calls. Vorteil: das Variation-Repo löst die Sub-Relations zuverlässig eager auf, anders als das Item-Repo. Konsumenten-Vertrag (`page`/`per_page`/`has_next_page`) bleibt item-basiert wie zuvor.
+
+**Dedizierte Zusatzfelder (pro Variante, seit v1.12.0):** Zusätzlich zu den generischen Listen `barcodes[]` und `properties[]` hebt der Export drei häufig gebrauchte Werte direkt heraus. Sie sind `null`, wenn die Quelle für die Variante nicht gesetzt ist.
+
+| Feld | Quelle | Bemerkung |
+|---|---|---|
+| `ean` | Barcode mit `barcode_id == 1` | `code` dieses Barcodes, als String (führende Nullen/Länge bleiben erhalten). |
+| `tiktok_brand_id` | Eigenschaft `property_id == 121` | `value_string` (Texttyp). **Bewusst String** — TikTok-Marken-IDs sind lange numerische Werte, die als Zahl Präzision verlieren würden. |
+| `electronics_label_url` | Eigenschaft `property_id == 122` | `value_string` (Datei-Eigenschaft, erwartet einen Link/URL zur PDF der Elektrogeräte-Kennzeichnung). |
+
+⚠️ **Wichtig zur Datenquelle:** Diese Felder lesen aus der klassischen `variationProperties`-Relation (= das, was schon in `properties[]` erscheint). Falls 121/122 als **neue Plenty-„Eigenschaften" (Properties 2.0 / Merkmale)** angelegt wurden, laufen sie über eine *andere* Relation und tauchen weder in `properties[]` noch in diesen Feldern auf — dann ist ein zusätzlicher Repository-Load nötig.
+
+**So prüfst du in 1 Minute, welcher Fall vorliegt** (Variante mit gesetzten Werten verwenden):
+```powershell
+$h = @{ "X-Api-Key" = "<key>" }
+$r = Invoke-RestMethod "https://<shop>/rest/article-list-4711/external/articles?per_page=200" -Headers $h
+$r.data.variations.properties | Where-Object { $_.property_id -in 121,122 }
+```
+Kommt hier etwas zurück → klassische Eigenschaften, die neuen Felder funktionieren direkt. Bleibt es leer → neue „Eigenschaften", bitte melden (dann ergänze ich die passende Relation).
 
 Bei `by-marking` kommen zwei zusätzliche Felder dazu — alles andere ist identisch:
 
