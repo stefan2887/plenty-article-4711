@@ -124,8 +124,8 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
           "categories": [{ "category_id": 12, "plenty_id": 0, "position": 0, "is_default": true }],
           "properties": [{ "property_id": 5, "value_int": null, "value_float": null, "value_string": "Edelstahl", "value_selection": null, "surcharge": null }],
           "properties_v2": [
-            { "property_id": 121, "selection_id": 88, "selection_name": "7223333383127172870", "selection_description": "KRUPS", "value_int": null, "value_float": null, "value_file": null, "value_texts": [] },
-            { "property_id": 122, "selection_id": null, "selection_name": null, "selection_description": null, "value_int": null, "value_float": null, "value_file": "https://s3-eu-central-1.amazonaws.com/.../kennzeichnung.pdf", "value_texts": [] }
+            { "property_id": 121, "value": null, "texts": [], "selections": [{ "selection_id": 88, "name": "7223333383127172870", "description": "KRUPS" }] },
+            { "property_id": 122, "value": "https://s3-eu-central-1.amazonaws.com/.../kennzeichnung.pdf", "texts": [], "selections": [] }
           ],
           "clients":    [{ "plenty_id": 0 }],
           "markets":    [{ "market_id": "11.04", "referrer_id": "11.04", "referrer_name": "tiktok", "referrer_backend_name": "TikTok Krupsid", "sku": "...", "initial_sku": "..." }],
@@ -173,27 +173,26 @@ Plenty hat **zwei** Eigenschaften-Systeme. Der Export liefert beide getrennt:
 - `properties[]` — **klassische** Item-/Variations-Eigenschaften (Relation `variationProperties`).
 - `properties_v2[]` — **neue „Eigenschaften"** (Properties V2, Artikel-Tab *Eigenschaften*, Relation `propertiesV2`). Die TikTok-Felder liegen hier.
 
+Intern liefert `propertiesV2` Plenty-`PropertyRelation`-Objekte: Wert für **Datei/Zahl/Datum** steht direkt in `value`, **Text** in `values[]`, **Auswahl** in `selectionValues[].selection.names[]`. Diese Sub-Relationen werden per nested `with` mitgeladen.
+
 **`properties_v2[]` pro Variante** (eine Zeile je gesetzter Eigenschaft):
 
 | Feld | Bedeutung |
 |---|---|
 | `property_id` | ID der Eigenschaft (z. B. 121, 122) |
-| `selection_id` | bei Typ *Auswahl*: ID des gewählten Eintrags |
-| `selection_name` | Klartext der Auswahl (aufgelöst via `PropertySelectionRepositoryContract`) — z. B. die TikTok-Marken-ID |
-| `selection_description` | optionaler Zusatztext der Auswahl (z. B. `KRUPS`) |
-| `value_int` / `value_float` | bei Zahl-Typen |
-| `value_file` | bei Typ *Datei*: die Datei-URL (z. B. S3-Link zur PDF) |
-| `value_texts` | bei Text/HTML-Typen: Map `lang → Text` |
+| `value` | Direktwert bei Typ *Datei* (URL), *Zahl* oder *Datum* |
+| `texts` | bei Text/HTML-Typen: Map `lang → Text` |
+| `selections` | bei Typ *Auswahl*: Liste `[{ selection_id, name, description }]` (Klartext sprachabhängig) — `name` ist z. B. die TikTok-Marken-ID, `description` der Klartext (z. B. `KRUPS`) |
 
 **Dedizierte Zusatzfelder (pro Variante, seit v1.13.0):** zusätzlich direkt herausgehoben, `null` wenn nicht gesetzt:
 
 | Feld | Quelle | Bemerkung |
 |---|---|---|
 | `ean` | Barcode `barcode_id == 1` → `code` | String (führende Nullen/Länge bleiben erhalten). |
-| `tiktok_brand_id` | V2-Eigenschaft `121` (Typ *Auswahl*) | `selection_name`. **Bewusst String** — TikTok-Marken-IDs sind lange numerische Werte, die als Zahl Präzision verlieren würden. |
-| `electronics_label_url` | V2-Eigenschaft `122` (Typ *Datei*) | `value_file` — Link/URL zur PDF der Elektrogeräte-Kennzeichnung. |
+| `tiktok_brand_id` | V2-Eigenschaft `121` (Typ *Auswahl*) | `selections[0].name`. **Bewusst String** — TikTok-Marken-IDs sind lange numerische Werte, die als Zahl Präzision verlieren würden. |
+| `electronics_label_url` | V2-Eigenschaft `122` (Typ *Datei*) | `value` — Link/URL zur PDF der Elektrogeräte-Kennzeichnung. |
 
-`propertyV2Value()` wählt pro Eigenschaft den „besten" Klartext in der Reihenfolge Auswahl-Name → Datei-URL → Text → Int → Float. Property-IDs als Konstanten in `ExternalArticleController` (`PROP_TIKTOK_BRAND_ID`, `PROP_ELECTRONICS_LABEL`, `BARCODE_EAN_ID`).
+`propertyV2Value()` wählt pro Eigenschaft den „besten" Klartext in der Reihenfolge Auswahl-Name → `value` (Datei-URL/Zahl) → Text. Property-IDs als Konstanten in `ExternalArticleController` (`PROP_TIKTOK_BRAND_ID`, `PROP_ELECTRONICS_LABEL`, `BARCODE_EAN_ID`).
 
 **Prüfen:**
 ```powershell

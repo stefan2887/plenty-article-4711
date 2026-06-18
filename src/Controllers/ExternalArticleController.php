@@ -10,7 +10,6 @@ use Plenty\Modules\Item\Item\Contracts\ItemRepositoryContract;
 use Plenty\Modules\Item\Variation\Contracts\VariationSearchRepositoryContract;
 use Plenty\Modules\Item\SalesPrice\Contracts\SalesPriceRepositoryContract;
 use Plenty\Modules\Order\Referrer\Contracts\OrderReferrerRepositoryContract;
-use Plenty\Modules\Item\Property\Contracts\PropertySelectionRepositoryContract;
 use Plenty\Modules\Authorization\Services\AuthHelper;
 
 class ExternalArticleController extends Controller
@@ -51,13 +50,11 @@ class ExternalArticleController extends Controller
     private static $referrerMap = [];
 
     /**
-     * Per-Request-Cache: propertySelectionId => ['name' => ?string, 'description' => ?string].
-     * Befüllt aus PropertySelectionRepositoryContract::findByProperty() für alle
-     * V2-Eigenschaften vom Typ Auswahl (siehe loadSelectionMap()); konsumiert von
-     * extractPropertiesV2()/propertyV2Value() zur Auflösung von Auswahl-Klartexten.
-     * Reset am Anfang von loadArticlePage(), siehe $currencyMap.
+     * Per-Request-Sprache (aus parsePagination), genutzt zur Auswahl der
+     * passenden V2-Selection-/Text-Sprache in den propertiesV2-Helfern.
+     * Gesetzt am Anfang von loadArticlePage().
      */
-    private static $selectionMap = [];
+    private static $lang = 'de';
 
     /**
      * Eager-Load-Liste für den Item-Load (Schritt 1).
@@ -80,7 +77,17 @@ class ExternalArticleController extends Controller
         return [
             'variationSalesPrices'     => null,
             'variationProperties'      => null,
-            'propertiesV2'             => null,
+            // V2-"Eigenschaften": PropertyRelation mit Wert in `value` (Datei/Zahl),
+            // Text in `values[]`, Auswahl in `selectionValues[].selection.names[]`.
+            // Sub-Relationen explizit mitladen (nested with).
+            'propertiesV2'             => [
+                'values'          => null,
+                'selectionValues' => [
+                    'selection' => [
+                        'names' => null,
+                    ],
+                ],
+            ],
             'variationBarcodes'        => null,
             'variationCategories'      => null,
             'variationClients'         => null,
@@ -99,14 +106,13 @@ class ExternalArticleController extends Controller
         VariationSearchRepositoryContract $variationRepository,
         SalesPriceRepositoryContract $salesPriceRepository,
         OrderReferrerRepositoryContract $orderReferrerRepository,
-        PropertySelectionRepositoryContract $propertySelectionRepository,
         AuthHelper $authHelper
     ) {
         $authErr = self::requireValidApiKey($request, $response, $config);
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $propertySelectionRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang);
 
         return $response->json([
             'data'       => $loaded['articles'],
@@ -139,7 +145,6 @@ class ExternalArticleController extends Controller
         VariationSearchRepositoryContract $variationRepository,
         SalesPriceRepositoryContract $salesPriceRepository,
         OrderReferrerRepositoryContract $orderReferrerRepository,
-        PropertySelectionRepositoryContract $propertySelectionRepository,
         AuthHelper $authHelper,
         int $storeSpecial
     ) {
@@ -147,7 +152,7 @@ class ExternalArticleController extends Controller
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $propertySelectionRepository, $page, $perPage, $lang);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang);
 
         $filtered = [];
         foreach ($loaded['articles'] as $article) {
@@ -212,15 +217,14 @@ class ExternalArticleController extends Controller
         VariationSearchRepositoryContract $variationRepository,
         SalesPriceRepositoryContract $salesPriceRepository,
         OrderReferrerRepositoryContract $orderReferrerRepository,
-        PropertySelectionRepositoryContract $propertySelectionRepository,
         int $page,
         int $perPage,
         string $lang
     ): array {
-        // Per-Request-Reset der Caches.
-        self::$currencyMap  = [];
-        self::$referrerMap  = [];
-        self::$selectionMap = [];
+        // Per-Request-Reset der Caches + Sprache.
+        self::$currencyMap = [];
+        self::$referrerMap = [];
+        self::$lang        = $lang;
 
         // Schritt 1: Items paginieren (Item-Pagination bleibt der Konsumenten-Vertrag).
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
@@ -249,11 +253,6 @@ class ExternalArticleController extends Controller
         // Schritt 2c: Referrer-Namen vorladen — ein getList()-Call statt
         // N findById()-Lookups (Shops haben typisch <100 Herkünfte).
         self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
-
-        // Schritt 2d: V2-Eigenschaften vom Typ Auswahl auflösen — Selection-IDs
-        // → Klartext. Ein findByProperty()-Call je betroffener Property (typisch
-        // wenige), gekeyed nach globaler propertySelectionId.
-        self::$selectionMap = self::loadSelectionMap($authHelper, $propertySelectionRepository, $variationsByItemId, $lang);
 
         // Schritt 3: serialize, jeweils mit den passenden Varianten angereichert.
         $articles = [];
@@ -368,70 +367,6 @@ class ExternalArticleController extends Controller
                     'name'         => self::asString(self::prop($r, 'name')),
                     'backend_name' => self::asString(self::prop($r, 'backendName')),
                 ];
-            }
-        }
-        return $map;
-    }
-
-    /**
-     * Baut die Selection-Map für V2-Eigenschaften vom Typ Auswahl:
-     * propertySelectionId => ['name' => ?string, 'description' => ?string].
-     *
-     * Sammelt zunächst alle propertyIds, die in `propertiesV2` mit einer
-     * `propertySelectionId` auftauchen, und holt je Property einmal die
-     * Auswahl-Liste via PropertySelectionRepositoryContract::findByProperty().
-     * propertySelectionIds sind global eindeutig — die Map ist deshalb flach
-     * nach Selection-ID gekeyed.
-     */
-    private static function loadSelectionMap(
-        AuthHelper $authHelper,
-        PropertySelectionRepositoryContract $propertySelectionRepository,
-        array $variationsByItemId,
-        string $lang
-    ): array {
-        $propertyIds = [];
-        foreach ($variationsByItemId as $variationList) {
-            foreach ($variationList as $v) {
-                $propsV2 = self::prop($v, 'propertiesV2');
-                if (!self::isIterable_($propsV2)) continue;
-                foreach ($propsV2 as $pv) {
-                    $selId  = self::asInt(self::prop($pv, 'propertySelectionId'));
-                    $propId = self::asInt(self::prop($pv, 'propertyId'));
-                    if ($selId !== null && $selId > 0 && $propId !== null) {
-                        $propertyIds[$propId] = true;
-                    }
-                }
-            }
-        }
-        if (empty($propertyIds)) {
-            return [];
-        }
-
-        $rawByProperty = $authHelper->processUnguarded(function () use ($propertySelectionRepository, $propertyIds, $lang) {
-            $raw = [];
-            foreach (array_keys($propertyIds) as $propId) {
-                try {
-                    $raw[$propId] = $propertySelectionRepository->findByProperty($propId, $lang);
-                } catch (\Throwable $e) {
-                    // Eine Property ohne Auswahl-Liste darf den Request nicht kippen.
-                    $raw[$propId] = [];
-                }
-            }
-            return $raw;
-        });
-
-        $map = [];
-        if (is_array($rawByProperty)) {
-            foreach ($rawByProperty as $selections) {
-                if (!self::isIterable_($selections)) continue;
-                foreach ($selections as $sel) {
-                    $selId = self::asInt(self::prop($sel, 'id'));
-                    if ($selId === null) continue;
-                    $map[$selId] = [
-                        'name'        => self::asString(self::prop($sel, 'name')),
-                        'description' => self::asString(self::prop($sel, 'description')),
-                    ];
-                }
             }
         }
         return $map;
@@ -820,35 +755,28 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Serialisiert die V2-"Eigenschaften" (propertiesV2) einer Variante zu einer
-     * generischen Liste. Jeder Eintrag deckt alle Werttypen ab: Auswahl (über die
-     * vorgeladene Selection-Map), Datei (valueFile), Text (valueTexts) sowie
-     * Int/Float. So sind auch künftige Eigenschaften ohne Code-Änderung sichtbar.
+     * Serialisiert die V2-"Eigenschaften" (propertiesV2) einer Variante. Jeder
+     * Eintrag ist ein `PropertyRelation`: Datei/Zahl/Datum stehen direkt in
+     * `value`, Texte in `values[]` (lang/value), Auswahlen in `selectionValues[]`
+     * (selectionId + nested `selection.names[]`). So sind auch künftige
+     * Eigenschaften ohne Code-Änderung sichtbar.
      */
     private static function extractPropertiesV2($c): array
     {
         if (!self::isIterable_($c)) return [];
         $out = [];
         foreach ($c as $pv) {
-            $selId = self::asInt(self::prop($pv, 'propertySelectionId'));
-            $sel   = ($selId !== null && isset(self::$selectionMap[$selId]))
-                ? self::$selectionMap[$selId]
-                : ['name' => null, 'description' => null];
             $out[] = [
-                'property_id'           => self::asInt(self::prop($pv, 'propertyId')),
-                'selection_id'          => $selId,
-                'selection_name'        => $sel['name'],
-                'selection_description' => $sel['description'],
-                'value_int'             => self::asInt(self::prop($pv, 'valueInt')),
-                'value_float'           => self::asFloat(self::prop($pv, 'valueFloat')),
-                'value_file'            => self::asString(self::prop($pv, 'valueFile')),
-                'value_texts'           => self::extractValueTexts(self::prop($pv, 'valueTexts')),
+                'property_id' => self::asInt(self::prop($pv, 'propertyId')),
+                'value'       => self::asString(self::prop($pv, 'value')),
+                'texts'       => self::extractValueTexts(self::prop($pv, 'values')),
+                'selections'  => self::extractSelectionValues(self::prop($pv, 'selectionValues')),
             ];
         }
         return $out;
     }
 
-    /** Map lang => value aus den valueTexts einer V2-Eigenschaft (Text/HTML-Typ). */
+    /** Map lang => value aus den `values[]` (PropertyRelationValue) einer V2-Eigenschaft. */
     private static function extractValueTexts($c): array
     {
         if (!self::isIterable_($c)) return [];
@@ -862,9 +790,49 @@ class ExternalArticleController extends Controller
     }
 
     /**
+     * Serialisiert die `selectionValues[]` (PropertyRelationSelection) einer
+     * V2-Auswahl-Eigenschaft zu `[{selection_id, name, description}]`. Der Klartext
+     * kommt aus der nested `selection.names[]` (PropertySelectionName), sprach-
+     * abhängig (self::$lang, sonst erster Treffer).
+     */
+    private static function extractSelectionValues($c): array
+    {
+        if (!self::isIterable_($c)) return [];
+        $out = [];
+        foreach ($c as $sv) {
+            $name = self::selectionNameForLang(self::prop(self::prop($sv, 'selection'), 'names'));
+            $out[] = [
+                'selection_id' => self::asInt(self::prop($sv, 'selectionId')),
+                'name'         => $name['name'],
+                'description'  => $name['description'],
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Wählt aus den PropertySelectionName-Einträgen den passenden Sprach-Treffer
+     * (self::$lang, sonst den ersten) und liefert ['name' =>, 'description' =>].
+     */
+    private static function selectionNameForLang($names): array
+    {
+        $fallback = ['name' => null, 'description' => null];
+        if (!self::isIterable_($names)) return $fallback;
+        foreach ($names as $n) {
+            $entry = [
+                'name'        => self::asString(self::prop($n, 'name')),
+                'description' => self::asString(self::prop($n, 'description')),
+            ];
+            if ($fallback['name'] === null) $fallback = $entry; // erster Treffer als Default
+            if (self::asString(self::prop($n, 'lang')) === self::$lang) return $entry;
+        }
+        return $fallback;
+    }
+
+    /**
      * Liefert den "besten" Klartext-Wert einer V2-Eigenschaft (per propertyId) als
      * String — passend für die dedizierten Felder. Reihenfolge: Auswahl-Name →
-     * Datei-URL (valueFile) → Text (erster valueText) → Int → Float.
+     * Wert `value` (Datei-URL/Zahl/Datum) → Text (erster `values`-Eintrag).
      *
      * Bewusst String: TikTok-Marken-IDs (Auswahl) sind lange numerische Werte, die
      * als Zahl Präzision verlieren würden; bei der Datei-Eigenschaft steht hier der
@@ -876,22 +844,15 @@ class ExternalArticleController extends Controller
         foreach ($c as $pv) {
             if (self::asInt(self::prop($pv, 'propertyId')) !== $propertyId) continue;
 
-            $selId = self::asInt(self::prop($pv, 'propertySelectionId'));
-            if ($selId !== null && $selId > 0 && isset(self::$selectionMap[$selId]['name'])) {
-                $name = self::$selectionMap[$selId]['name'];
-                if ($name !== null && $name !== '') return $name;
+            foreach (self::extractSelectionValues(self::prop($pv, 'selectionValues')) as $sel) {
+                if ($sel['name'] !== null && $sel['name'] !== '') return $sel['name'];
             }
-            $file = self::asString(self::prop($pv, 'valueFile'));
-            if ($file !== null && $file !== '') return $file;
+            $value = self::asString(self::prop($pv, 'value'));
+            if ($value !== null && $value !== '') return $value;
 
-            $texts = self::extractValueTexts(self::prop($pv, 'valueTexts'));
-            foreach ($texts as $t) {
+            foreach (self::extractValueTexts(self::prop($pv, 'values')) as $t) {
                 if ($t !== null && $t !== '') return $t;
             }
-            $i = self::prop($pv, 'valueInt');
-            if ($i !== null && $i !== '') return self::asString($i);
-            $f = self::prop($pv, 'valueFloat');
-            if ($f !== null && $f !== '') return self::asString($f);
         }
         return null;
     }
@@ -1141,10 +1102,12 @@ class ExternalArticleController extends Controller
             case 'valueString':                 return isset($obj->valueString)                 ? $obj->valueString                 : null;
             case 'valueSelection':              return isset($obj->valueSelection)              ? $obj->valueSelection              : null;
             case 'surcharge':                   return isset($obj->surcharge)                   ? $obj->surcharge                   : null;
-            // V2 Property (VariationPropertyValue / PropertySelection / VariationPropertyValueText)
-            case 'propertySelectionId':         return isset($obj->propertySelectionId)         ? $obj->propertySelectionId         : null;
-            case 'valueFile':                   return isset($obj->valueFile)                   ? $obj->valueFile                   : null;
-            case 'valueTexts':                  return isset($obj->valueTexts)                  ? $obj->valueTexts                  : null;
+            // V2 Property (PropertyRelation / PropertyRelationValue / PropertyRelationSelection / PropertySelectionName)
+            case 'values':                      return isset($obj->values)                      ? $obj->values                      : null;
+            case 'selectionValues':             return isset($obj->selectionValues)             ? $obj->selectionValues             : null;
+            case 'selectionId':                 return isset($obj->selectionId)                 ? $obj->selectionId                 : null;
+            case 'selection':                   return isset($obj->selection)                   ? $obj->selection                   : null;
+            case 'names':                       return isset($obj->names)                       ? $obj->names                       : null;
             case 'description':                 return isset($obj->description)                 ? $obj->description                 : null;
             case 'lang':                        return isset($obj->lang)                        ? $obj->lang                        : null;
             case 'value':                       return isset($obj->value)                       ? $obj->value                       : null;
