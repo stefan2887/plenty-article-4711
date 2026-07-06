@@ -578,9 +578,8 @@ class ExternalArticleController extends Controller
     }
 
     /** Sicherer verschachtelter Array-Zugriff: eget($arr, 'a', 'b') = $arr['a']['b'] ?? null. */
-    private static function eget($arr)
+    private static function eget($arr, ...$keys)
     {
-        $keys = array_slice(func_get_args(), 1);
         foreach ($keys as $k) {
             if (!is_array($arr) || !array_key_exists($k, $arr)) return null;
             $arr = $arr[$k];
