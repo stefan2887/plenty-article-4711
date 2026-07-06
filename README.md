@@ -49,7 +49,7 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
 | `page` | `1` | — | 1-basierte Seite |
 | `per_page` | `50` | `200` | Items pro Seite (hartes Maximum: 200) |
 | `lang` | `de` | — | Bevorzugte Sprache für `primary_name`; `texts_by_lang` enthält alle verfügbaren Sprachen |
-| `referrer_id` | — | — | **Herkunft-Filter (nur `/articles`).** Nur Artikel, die die angegebene(n) Herkunft/-künfte führen. Mehrere per Komma, z. B. `?referrer_id=11.04,1,104`. Match, wenn **irgendeine** Variante die Herkunft trägt. **Server-seitig** über die herkunft-gefilterte Variations-Suche — es werden nur die Treffer-Artikel geladen, nicht der ganze Katalog, und `total_count` = **Treffer-Anzahl** (item-basierte Paginierung). Antwort enthält dann `filter` + `meta.filter_applied: "plenty_referrer_search"`. |
+| `referrer_id` | — | — | **Herkunft-Filter (nur `/articles`).** Nur Artikel, die die angegebene(n) Herkunft/-künfte führen. Mehrere per Komma, z. B. `?referrer_id=11.04,1,104`. Match, wenn **irgendeine** Variante die Herkunft (`variations[].markets[].referrer_id`) trägt. Der Server **scannt serverseitig den ganzen Katalog** und liefert in **einem** Aufruf **alle** Treffer — **kein** Client-seitiges Paginieren nötig. `total_count` = `returned_count` = Treffer-Anzahl, `has_next_page: false`. Antwort enthält `filter` + `meta.filter_applied: "server_side_full_scan"`. Bei sehr großen Katalogen greift eine Scan-Kappe (`MAX_SCAN_PAGES`), dann `meta.filter_truncated: true`. Hinweis: Plenty ignoriert den serverseitigen `referrerId`-Suchparameter in dieser Version, daher der Voll-Scan; `page`/`per_page` werden im Filter-Modus ignoriert. |
 
 **Route-Parameter (nur `by-marking`):**
 
