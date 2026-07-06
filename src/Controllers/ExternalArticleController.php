@@ -380,15 +380,21 @@ class ExternalArticleController extends Controller
         // Bevorzugt echt serverseitig über die Elastic-Suche mit SkuFilter::hasMarketId()
         // (O(Treffer), kein Katalog-Scan). Schlägt das fehl oder liefert nichts,
         // Fallback auf den leichten Katalog-Scan (garantiert korrekt).
+        // Nur bei einer Exception der Elastic-Suche auf den Scan zurückfallen —
+        // ein erfolgreiches (auch leeres) Elastic-Ergebnis wird vertraut, sonst
+        // würde eine Null-Treffer-Abfrage unnötig den ganzen Katalog scannen.
         $truncated    = false;
-        $filterSource = 'elastic_sku_filter';
+        $elasticOk    = false;
         $matchedItemIds = [];
         try {
             $matchedItemIds = self::collectReferrerItemIdsElastic($authHelper, $referrerFilter);
+            $elasticOk = true;
         } catch (\Throwable $e) {
-            $matchedItemIds = [];
+            $elasticOk = false;
         }
-        if (empty($matchedItemIds)) {
+        if ($elasticOk) {
+            $filterSource = 'elastic_sku_filter';
+        } else {
             $filterSource   = 'scan_fallback';
             $matchedItemIds = self::scanReferrerItemIds(
                 $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
