@@ -114,16 +114,38 @@ class ExternalArticleController extends Controller
         list($page, $perPage, $lang) = self::parsePagination($request);
         $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang);
 
-        return $response->json([
-            'data'       => $loaded['articles'],
-            'pagination' => $loaded['pagination'],
-            'meta'       => self::baseMeta($request) + [
-                'lang'                 => $lang,
-                'with_item'            => self::itemRelations(),
-                'with_variation'       => array_keys(self::variationRelations()),
-                'schema_version'       => self::SCHEMA_VERSION,
-            ],
-        ], 200);
+        $articles   = $loaded['articles'];
+        $pagination = $loaded['pagination'];
+        $meta = self::baseMeta($request) + [
+            'lang'                 => $lang,
+            'with_item'            => self::itemRelations(),
+            'with_variation'       => array_keys(self::variationRelations()),
+            'schema_version'       => self::SCHEMA_VERSION,
+        ];
+
+        // Optionaler Herkunft-Filter: ?referrer_id=11.04 (mehrere per Komma).
+        // Post-Load im PHP — dieselbe Semantik wie by-marking (siehe README).
+        $referrerFilter = self::parseReferrerFilter($request);
+        $result = [
+            'data'       => $articles,
+            'pagination' => $pagination,
+            'meta'       => $meta,
+        ];
+        if (!empty($referrerFilter)) {
+            $filtered = [];
+            foreach ($articles as $article) {
+                if (self::articleHasReferrer($article, $referrerFilter)) {
+                    $filtered[] = $article;
+                }
+            }
+            $pagination['returned_count'] = count($filtered);
+            $result['data']       = $filtered;
+            $result['pagination'] = $pagination;
+            $result['filter']     = ['referrer_id' => $referrerFilter];
+            $result['meta']       = $meta + ['filter_applied' => 'post_load_php'];
+        }
+
+        return $response->json($result, 200);
     }
 
     /**
@@ -209,6 +231,51 @@ class ExternalArticleController extends Controller
         if ($lang === '') $lang = 'de';
 
         return [$page, $perPage, $lang];
+    }
+
+    /**
+     * Liest den optionalen Herkunft-Filter aus `?referrer_id=…` (mehrere Werte
+     * per Komma, z. B. `11.04,1,104`). Liefert eine deduplizierte Liste von
+     * normalisierten Referrer-ID-Strings; leeres Array = kein Filter.
+     *
+     * Numerische Eingaben werden über referrerIdString() gleich normalisiert wie
+     * die Markt-IDs im Export (z. B. `11.040` → `11.04`), damit der Vergleich in
+     * articleHasReferrer() beidseitig konsistent ist.
+     */
+    private static function parseReferrerFilter(Request $request): array
+    {
+        $raw = (string) $request->get('referrer_id', '');
+        if ($raw === '') return [];
+
+        $out = [];
+        foreach (explode(',', $raw) as $part) {
+            $p = trim($part);
+            if ($p === '') continue;
+            $norm = is_numeric($p) ? self::referrerIdString((float) $p) : $p;
+            if ($norm !== null && $norm !== '') $out[$norm] = true;
+        }
+        return array_keys($out);
+    }
+
+    /**
+     * Prüft, ob ein (bereits serialisierter) Artikel mindestens eine der
+     * gewünschten Herkünfte trägt. Match über die Markt-Herkünfte ALLER Varianten
+     * (`variations[].markets[].referrer_id`) — ein Artikel gilt als Treffer, sobald
+     * eine Variante den Kanal führt.
+     */
+    private static function articleHasReferrer(array $article, array $wanted): bool
+    {
+        if (empty($wanted) || empty($article['variations'])) return false;
+        $wantedSet = array_flip($wanted);
+        foreach ($article['variations'] as $v) {
+            if (empty($v['markets'])) continue;
+            foreach ($v['markets'] as $m) {
+                if (isset($m['referrer_id']) && isset($wantedSet[$m['referrer_id']])) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static function loadArticlePage(
