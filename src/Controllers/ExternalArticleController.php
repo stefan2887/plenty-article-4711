@@ -393,11 +393,8 @@ class ExternalArticleController extends Controller
             // Elastic liefert die vollständigen Variations-Dokumente je Herkunft.
             $docsByItem = self::collectReferrerDocsElastic($authHelper, $referrerFilter);
             self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
-            // Währung nachziehen: Elastic-Preise haben kein currency-Feld → über die
-            // SalesPrice-IDs auflösen (SalesPriceRepository), von elasticPrices genutzt.
-            self::$currencyMap = self::loadCurrencyMapForIds(
-                $authHelper, $salesPriceRepository, self::collectElasticSalesPriceIds($docsByItem)
-            );
+            // Währung kommt direkt aus salesPrices[].settings.currencies (elasticPrices);
+            // kein SalesPrice-findById-Roundtrip nötig.
             foreach ($docsByItem as $docs) {
                 $articles[] = self::serializeElasticArticle($docs);
             }
@@ -757,12 +754,18 @@ class ExternalArticleController extends Controller
         $out = [];
         foreach ($salesPrices as $p) {
             if (!is_array($p)) continue;
-            $spId     = self::asInt(self::eget($p, 'id'));
-            // Elastic-Preise haben kein currency-Feld — über die vorgeladene
-            // Currency-Map (SalesPrice-ID → Währung) nachziehen.
-            $currency = ($spId !== null && isset(self::$currencyMap[$spId]))
-                ? self::$currencyMap[$spId]
-                : null;
+            $spId = self::asInt(self::eget($p, 'id'));
+            // Währung steht bei Plenty in settings.currencies (Array, z. B. ["EUR"]) —
+            // das Feld `currency` ist oft leer. Ersten Eintrag nehmen; Fallback auf
+            // die vorgeladene Currency-Map (SalesPrice-ID → Währung), falls vorhanden.
+            $currency   = null;
+            $currencies = self::eget($p, 'settings', 'currencies');
+            if (is_array($currencies) && count($currencies) > 0) {
+                $currency = self::asString($currencies[0]);
+            }
+            if (($currency === null || $currency === '') && $spId !== null && isset(self::$currencyMap[$spId])) {
+                $currency = self::$currencyMap[$spId];
+            }
             $out[] = [
                 'sales_price_id' => $spId,
                 'price'          => self::asFloat(self::eget($p, 'price')),
@@ -1140,62 +1143,6 @@ class ExternalArticleController extends Controller
             }
         }
         return $byId;
-    }
-
-    /**
-     * Wie loadCurrencyMap(), aber direkt aus einer Liste von SalesPrice-IDs — für
-     * den Elastic-Pfad, dessen Preis-Dokumente keine Währung enthalten.
-     */
-    private static function loadCurrencyMapForIds(
-        AuthHelper $authHelper,
-        SalesPriceRepositoryContract $salesPriceRepository,
-        array $salesPriceIds
-    ): array {
-        $uniqueIds = [];
-        foreach ($salesPriceIds as $id) {
-            $i = self::asInt($id);
-            if ($i !== null) $uniqueIds[$i] = true;
-        }
-        if (empty($uniqueIds)) {
-            return [];
-        }
-
-        $rawSalesPrices = $authHelper->processUnguarded(function () use ($salesPriceRepository, $uniqueIds) {
-            $raw = [];
-            foreach (array_keys($uniqueIds) as $id) {
-                $sp = $salesPriceRepository->findById($id);
-                if ($sp !== null) $raw[$id] = $sp;
-            }
-            return $raw;
-        });
-
-        $byId = [];
-        if (is_array($rawSalesPrices)) {
-            foreach ($rawSalesPrices as $id => $sp) {
-                $currency = self::prop($sp, 'currency');
-                if (is_string($currency) && $currency !== '') {
-                    $byId[(int) $id] = $currency;
-                }
-            }
-        }
-        return $byId;
-    }
-
-    /** Sammelt einzigartige SalesPrice-IDs aus den Elastic-Dokumenten (data.salesPrices[].id). */
-    private static function collectElasticSalesPriceIds(array $docsByItem): array
-    {
-        $ids = [];
-        foreach ($docsByItem as $docs) {
-            foreach ($docs as $doc) {
-                $sp = self::eget(self::edata($doc), 'salesPrices');
-                if (!is_array($sp)) continue;
-                foreach ($sp as $p) {
-                    $id = self::asInt(self::eget($p, 'id'));
-                    if ($id !== null) $ids[$id] = true;
-                }
-            }
-        }
-        return array_keys($ids);
     }
 
     /**
