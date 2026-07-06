@@ -356,16 +356,16 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Lade-Pfad bei aktivem Herkunft-Filter, zweiphasig:
-     *   1. Treffer-Item-IDs bestimmen — bevorzugt ECHT serverseitig über die
-     *      Elastic-Suche mit `SkuFilter::hasMarketId()` (O(Treffer)); Fallback auf
-     *      den leichten Katalog-Scan (scanReferrerItemIds), falls Elastic scheitert.
-     *   2. Nur die Treffer voll laden (Varianten in Chunks + Item via show()) und
-     *      serialisieren.
+     * Lade-Pfad bei aktivem Herkunft-Filter:
+     *   - Elastic-Suche mit `SkuFilter::hasMarketId()` liefert die Treffer-VARIATIONS-
+     *     Dokumente → Variations-IDs → Variationen direkt darüber laden (robust auch
+     *     bei ungewöhnlichen Item-IDs). Fallback: leichter Katalog-Scan.
+     *   - Treffer-Item-IDs ergeben sich aus den geladenen Variationen; je Item das
+     *     Item via show() laden und serialisieren.
      *
      * Liefert in EINEM Aufruf ALLE Treffer (`total_count` = Treffer, kein Client-
-     * Loop). `filter_source` in der Rückgabe zeigt den genutzten Pfad. Der teure
-     * Teil (V2-Eigenschaften/Preise/Serialisierung) fällt nur für die Treffer an.
+     * Loop). `filter_source` zeigt den genutzten Pfad. Der teure Teil (V2-Eigen-
+     * schaften/Preise/Serialisierung) fällt nur für die Treffer an.
      */
     private static function loadAllMatchingByReferrer(
         AuthHelper $authHelper,
@@ -376,39 +376,48 @@ class ExternalArticleController extends Controller
         array $referrerFilter,
         string $lang
     ): array {
-        // Phase 1: Treffer-Item-IDs bestimmen.
-        // Bevorzugt echt serverseitig über die Elastic-Suche mit SkuFilter::hasMarketId()
-        // (O(Treffer), kein Katalog-Scan). Schlägt das fehl oder liefert nichts,
-        // Fallback auf den leichten Katalog-Scan (garantiert korrekt).
-        // Nur bei einer Exception der Elastic-Suche auf den Scan zurückfallen —
-        // ein erfolgreiches (auch leeres) Elastic-Ergebnis wird vertraut, sonst
-        // würde eine Null-Treffer-Abfrage unnötig den ganzen Katalog scannen.
-        $truncated    = false;
-        $elasticOk    = false;
-        $matchedItemIds = [];
+        // Phase 1+2: Treffer bestimmen UND ihre Variationen laden.
+        // Bevorzugt echt serverseitig über die Elastic-Suche mit SkuFilter::hasMarketId().
+        // Die Elastic-Suche liefert VARIATIONS-Dokumente → wir ziehen die (kleinen,
+        // normalen) Variations-IDs und laden die Variationen DIREKT darüber. Das ist
+        // robust auch bei ungewöhnlichen/großen Item-IDs (TikTok-Import), bei denen
+        // ein Item-ID-Filter der Variations-Suche nichts findet.
+        // Nur bei einer Exception der Elastic-Suche auf den Katalog-Scan zurückfallen.
+        $truncated          = false;
+        $elasticOk          = false;
+        $variationsByItemId = [];
         try {
-            $matchedItemIds = self::collectReferrerItemIdsElastic($authHelper, $referrerFilter);
+            $variationIds = self::collectReferrerVariationIdsElastic($authHelper, $referrerFilter);
+            foreach (array_chunk($variationIds, self::MAX_PER_PAGE) as $chunk) {
+                foreach (self::loadVariationsByVariationIds($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
+                    $variationsByItemId[$iid] = isset($variationsByItemId[$iid])
+                        ? array_merge($variationsByItemId[$iid], $vlist)
+                        : $vlist;
+                }
+            }
             $elasticOk = true;
         } catch (\Throwable $e) {
             $elasticOk = false;
         }
+
         if ($elasticOk) {
             $filterSource = 'elastic_sku_filter';
         } else {
+            // Fallback: leichter Katalog-Scan → Treffer-Item-IDs → Varianten per Item-ID.
             $filterSource   = 'scan_fallback';
             $matchedItemIds = self::scanReferrerItemIds(
                 $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
             );
-        }
-        sort($matchedItemIds);
-
-        // Phase 2: nur die Treffer voll laden (Varianten in Item-ID-Chunks).
-        $variationsByItemId = [];
-        foreach (array_chunk($matchedItemIds, self::MAX_PER_PAGE) as $chunk) {
-            foreach (self::loadVariationsByItemId($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
-                $variationsByItemId[$iid] = $vlist;
+            foreach (array_chunk($matchedItemIds, self::MAX_PER_PAGE) as $chunk) {
+                foreach (self::loadVariationsByItemId($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
+                    $variationsByItemId[$iid] = $vlist;
+                }
             }
         }
+
+        $matchedItemIds = array_keys($variationsByItemId);
+        sort($matchedItemIds);
+
         self::$currencyMap = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
         self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
 
@@ -444,13 +453,14 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Bestimmt die Treffer-Item-IDs ECHT serverseitig über die Elastic-Suche mit
-     * `SkuFilter::hasMarketId($referrer)` — Plenty/Elastic filtert auf die
-     * Verkaufskanal-/Herkunft-ID (Float, z. B. 11.04), wir bekommen direkt nur die
-     * Treffer (O(Treffer), kein Katalog-Scan). Je Herkunft seitenweise, Item-IDs
-     * vereinigt. Wirft bei API-Fehlern — der Aufrufer fällt dann auf den Scan zurück.
+     * Bestimmt die Treffer-VARIATIONS-IDs ECHT serverseitig über die Elastic-Suche
+     * mit `SkuFilter::hasMarketId($referrer)` — Plenty/Elastic filtert auf die
+     * Verkaufskanal-/Herkunft-ID (Float, z. B. 11.04). Die Elastic-Suche liefert
+     * Variations-Dokumente; wir ziehen deren (kleine, normale) Variations-IDs, über
+     * die die Variationen anschließend zuverlässig geladen werden. Je Herkunft
+     * seitenweise, IDs vereinigt. Wirft bei API-Fehlern → Aufrufer fällt auf Scan zurück.
      */
-    private static function collectReferrerItemIdsElastic(
+    private static function collectReferrerVariationIdsElastic(
         AuthHelper $authHelper,
         array $referrerFilter
     ): array {
@@ -469,7 +479,7 @@ class ExternalArticleController extends Controller
                     $search->addFilter($skuFilter);
 
                     $source = pluginApp(IncludeSource::class);
-                    $source->activateList(['item.id', 'variation.id', 'variation.itemId']);
+                    $source->activateList(['variation.id', 'variation.itemId', 'item.id']);
                     $search->addSource($source);
                     $search->setPage($page, 1000);
 
@@ -487,8 +497,8 @@ class ExternalArticleController extends Controller
                 if (is_array($documents)) {
                     foreach ($documents as $doc) {
                         $count++;
-                        $itemId = self::extractItemIdFromDoc($doc);
-                        if ($itemId !== null) $ids[$itemId] = true;
+                        $variationId = self::extractVariationIdFromDoc($doc);
+                        if ($variationId !== null) $ids[$variationId] = true;
                     }
                 }
                 $page++;
@@ -498,19 +508,53 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Zieht die Item-ID tolerant aus einem Elastic-Ergebnis-Dokument. Das Format
-     * variiert je nach aktivierten Sources/Version — daher mehrere Pfade prüfen.
+     * Zieht die Variations-ID tolerant aus einem Elastic-Ergebnis-Dokument. Das
+     * Format variiert je nach aktivierten Sources/Version — daher mehrere Pfade.
      */
-    private static function extractItemIdFromDoc($doc): ?int
+    private static function extractVariationIdFromDoc($doc): ?int
     {
         if (!is_array($doc)) return null;
         $data = isset($doc['data']) && is_array($doc['data']) ? $doc['data'] : $doc;
 
-        if (isset($data['variation']['itemId']))  return self::asInt($data['variation']['itemId']);
-        if (isset($data['item']['id']))           return self::asInt($data['item']['id']);
-        if (isset($data['variation']['item']['id'])) return self::asInt($data['variation']['item']['id']);
-        if (isset($data['itemId']))               return self::asInt($data['itemId']);
+        if (isset($data['variation']['id'])) return self::asInt($data['variation']['id']);
+        if (isset($data['id']))              return self::asInt($data['id']);
+        if (isset($doc['id']))               return self::asInt($doc['id']);
         return null;
+    }
+
+    /**
+     * Lädt volle Variationen anhand einer Liste von Variations-IDs und gruppiert
+     * sie nach itemId. Sicherheitsfilter: nur angefragte IDs werden übernommen —
+     * so kann ein ignorierter `variationIds`-Param keine Fremd-Variationen einschleusen.
+     */
+    private static function loadVariationsByVariationIds(
+        AuthHelper $authHelper,
+        VariationSearchRepositoryContract $variationRepository,
+        array $variationIds
+    ): array {
+        if (empty($variationIds)) {
+            return [];
+        }
+        $wanted = array_flip($variationIds);
+
+        $rawVariations = $authHelper->processUnguarded(function () use ($variationRepository, $variationIds) {
+            $variationRepository->setSearchParams(['with' => self::variationRelations()]);
+            $result = $variationRepository->search(['variationIds' => $variationIds]);
+            return $result->getResult();
+        });
+
+        $byItemId = [];
+        if (is_array($rawVariations) || is_object($rawVariations)) {
+            foreach ($rawVariations as $v) {
+                $vid = self::asInt(self::prop($v, 'id'));
+                if ($vid === null || !isset($wanted[$vid])) continue;
+                $itemId = self::asInt(self::prop($v, 'itemId'));
+                if ($itemId === null) continue;
+                if (!isset($byItemId[$itemId])) $byItemId[$itemId] = [];
+                $byItemId[$itemId][] = $v;
+            }
+        }
+        return $byItemId;
     }
 
     /**
