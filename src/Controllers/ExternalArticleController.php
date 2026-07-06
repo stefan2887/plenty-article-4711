@@ -11,6 +11,11 @@ use Plenty\Modules\Item\Variation\Contracts\VariationSearchRepositoryContract;
 use Plenty\Modules\Item\SalesPrice\Contracts\SalesPriceRepositoryContract;
 use Plenty\Modules\Order\Referrer\Contracts\OrderReferrerRepositoryContract;
 use Plenty\Modules\Authorization\Services\AuthHelper;
+use Plenty\Modules\Item\Search\Contracts\VariationElasticSearchSearchRepositoryContract;
+use Plenty\Modules\Item\Search\Filter\SkuFilter;
+use Plenty\Modules\Cloud\ElasticSearch\Lib\Search\Document\DocumentSearch;
+use Plenty\Modules\Cloud\ElasticSearch\Lib\Processor\DocumentProcessor;
+use Plenty\Modules\Cloud\ElasticSearch\Lib\Source\IncludeSource;
 
 class ExternalArticleController extends Controller
 {
@@ -117,9 +122,8 @@ class ExternalArticleController extends Controller
         list($page, $perPage, $lang) = self::parsePagination($request);
 
         // Optionaler Herkunft-Filter: ?referrer_id=11.04 (mehrere per Komma).
-        // Bei gesetztem Filter treibt die herkunft-gefilterte Variations-Suche das
-        // Laden — es werden nur Treffer-Artikel geladen (nicht der ganze Katalog),
-        // und `total_count` = Treffer-Anzahl.
+        // Treffer werden serverseitig via Elastic-SkuFilter bestimmt (Fallback: Scan);
+        // es werden nur Treffer-Artikel geladen, `total_count` = Treffer-Anzahl.
         $referrerFilter = self::parseReferrerFilter($request);
         $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang, $referrerFilter);
 
@@ -139,9 +143,13 @@ class ExternalArticleController extends Controller
         ];
         if (!empty($referrerFilter)) {
             // loadAllMatchingByReferrer() liefert bereits ausschließlich Treffer.
-            $filterMeta = ['filter_applied' => 'server_side_full_scan'];
+            // filter_source zeigt, ob echt serverseitig (elastic_sku_filter) gefiltert
+            // wurde oder der Scan-Fallback griff (scan_fallback).
+            $filterMeta = [
+                'filter_applied' => 'referrer',
+                'filter_source'  => isset($loaded['filter_source']) ? $loaded['filter_source'] : 'scan_fallback',
+            ];
             if (!empty($loaded['truncated'])) {
-                // Scan-Kappe erreicht — nicht alle Seiten geprüft.
                 $filterMeta['filter_truncated'] = true;
                 $filterMeta['filter_scan_page_cap'] = self::MAX_SCAN_PAGES;
             }
@@ -348,17 +356,16 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Lade-Pfad bei aktivem Herkunft-Filter. Plenty ignoriert den serverseitigen
-     * `referrerId`-Suchparameter, daher zweiphasig:
-     *   1. LEICHTER Scan (scanReferrerItemIds) — pro Item-Seite nur IDs + Varianten
-     *      mit ausschließlich `variationMarkets` → Treffer-Item-IDs. Kein Volllast.
+     * Lade-Pfad bei aktivem Herkunft-Filter, zweiphasig:
+     *   1. Treffer-Item-IDs bestimmen — bevorzugt ECHT serverseitig über die
+     *      Elastic-Suche mit `SkuFilter::hasMarketId()` (O(Treffer)); Fallback auf
+     *      den leichten Katalog-Scan (scanReferrerItemIds), falls Elastic scheitert.
      *   2. Nur die Treffer voll laden (Varianten in Chunks + Item via show()) und
      *      serialisieren.
      *
      * Liefert in EINEM Aufruf ALLE Treffer (`total_count` = Treffer, kein Client-
-     * Loop). Bei sehr großen Katalogen greift MAX_SCAN_PAGES → `truncated: true`.
-     * Der teure Teil (V2-Eigenschaften/Preise/Serialisierung) fällt nur für die
-     * Treffer an, nicht für den ganzen Katalog.
+     * Loop). `filter_source` in der Rückgabe zeigt den genutzten Pfad. Der teure
+     * Teil (V2-Eigenschaften/Preise/Serialisierung) fällt nur für die Treffer an.
      */
     private static function loadAllMatchingByReferrer(
         AuthHelper $authHelper,
@@ -369,11 +376,24 @@ class ExternalArticleController extends Controller
         array $referrerFilter,
         string $lang
     ): array {
-        // Phase 1: LEICHTER Scan — nur variationMarkets laden, Treffer-Item-IDs sammeln.
-        $truncated      = false;
-        $matchedItemIds = self::scanReferrerItemIds(
-            $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
-        );
+        // Phase 1: Treffer-Item-IDs bestimmen.
+        // Bevorzugt echt serverseitig über die Elastic-Suche mit SkuFilter::hasMarketId()
+        // (O(Treffer), kein Katalog-Scan). Schlägt das fehl oder liefert nichts,
+        // Fallback auf den leichten Katalog-Scan (garantiert korrekt).
+        $truncated    = false;
+        $filterSource = 'elastic_sku_filter';
+        $matchedItemIds = [];
+        try {
+            $matchedItemIds = self::collectReferrerItemIdsElastic($authHelper, $referrerFilter);
+        } catch (\Throwable $e) {
+            $matchedItemIds = [];
+        }
+        if (empty($matchedItemIds)) {
+            $filterSource   = 'scan_fallback';
+            $matchedItemIds = self::scanReferrerItemIds(
+                $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
+            );
+        }
         sort($matchedItemIds);
 
         // Phase 2: nur die Treffer voll laden (Varianten in Item-ID-Chunks).
@@ -402,8 +422,8 @@ class ExternalArticleController extends Controller
 
         $total = count($articles);
         return [
-            'articles'   => $articles,
-            'pagination' => [
+            'articles'      => $articles,
+            'pagination'    => [
                 'page'           => 1,
                 'per_page'       => $total,
                 'returned_count' => $total,
@@ -412,8 +432,79 @@ class ExternalArticleController extends Controller
                 'is_last_page'   => true,
                 'has_next_page'  => false,
             ],
-            'truncated'  => $truncated,
+            'truncated'     => $truncated,
+            'filter_source' => $filterSource,
         ];
+    }
+
+    /**
+     * Bestimmt die Treffer-Item-IDs ECHT serverseitig über die Elastic-Suche mit
+     * `SkuFilter::hasMarketId($referrer)` — Plenty/Elastic filtert auf die
+     * Verkaufskanal-/Herkunft-ID (Float, z. B. 11.04), wir bekommen direkt nur die
+     * Treffer (O(Treffer), kein Katalog-Scan). Je Herkunft seitenweise, Item-IDs
+     * vereinigt. Wirft bei API-Fehlern — der Aufrufer fällt dann auf den Scan zurück.
+     */
+    private static function collectReferrerItemIdsElastic(
+        AuthHelper $authHelper,
+        array $referrerFilter
+    ): array {
+        $ids = [];
+        foreach ($referrerFilter as $refStr) {
+            if (!is_numeric($refStr)) continue;
+            $ref  = (float) $refStr;
+            $page = 1;
+            do {
+                $documents = $authHelper->processUnguarded(function () use ($ref, $page) {
+                    $processor = pluginApp(DocumentProcessor::class);
+                    $search    = pluginApp(DocumentSearch::class, [$processor]);
+
+                    $skuFilter = pluginApp(SkuFilter::class);
+                    $skuFilter->hasMarketId($ref);
+                    $search->addFilter($skuFilter);
+
+                    $source = pluginApp(IncludeSource::class);
+                    $source->activateList(['item.id', 'variation.id', 'variation.itemId']);
+                    $search->addSource($source);
+                    $search->setPage($page, 1000);
+
+                    $repo = pluginApp(VariationElasticSearchSearchRepositoryContract::class);
+                    $repo->addSearch($search);
+                    $result = $repo->execute();
+
+                    if (is_array($result) && isset($result['documents']) && is_array($result['documents'])) {
+                        return $result['documents'];
+                    }
+                    return is_array($result) ? $result : [];
+                });
+
+                $count = 0;
+                if (is_array($documents)) {
+                    foreach ($documents as $doc) {
+                        $count++;
+                        $itemId = self::extractItemIdFromDoc($doc);
+                        if ($itemId !== null) $ids[$itemId] = true;
+                    }
+                }
+                $page++;
+            } while ($count >= 1000 && $page <= self::MAX_SCAN_PAGES);
+        }
+        return array_keys($ids);
+    }
+
+    /**
+     * Zieht die Item-ID tolerant aus einem Elastic-Ergebnis-Dokument. Das Format
+     * variiert je nach aktivierten Sources/Version — daher mehrere Pfade prüfen.
+     */
+    private static function extractItemIdFromDoc($doc): ?int
+    {
+        if (!is_array($doc)) return null;
+        $data = isset($doc['data']) && is_array($doc['data']) ? $doc['data'] : $doc;
+
+        if (isset($data['variation']['itemId']))  return self::asInt($data['variation']['itemId']);
+        if (isset($data['item']['id']))           return self::asInt($data['item']['id']);
+        if (isset($data['variation']['item']['id'])) return self::asInt($data['variation']['item']['id']);
+        if (isset($data['itemId']))               return self::asInt($data['itemId']);
+        return null;
     }
 
     /**
