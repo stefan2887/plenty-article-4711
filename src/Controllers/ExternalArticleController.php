@@ -243,8 +243,8 @@ class ExternalArticleController extends Controller
      * normalisierten Referrer-ID-Strings; leeres Array = kein Filter.
      *
      * Numerische Eingaben werden über referrerIdString() gleich normalisiert wie
-     * die Markt-IDs im Export (z. B. `11.040` → `11.04`), damit der Vergleich in
-     * articleHasReferrer() beidseitig konsistent ist.
+     * die Markt-IDs (z. B. `11.040` → `11.04`), damit der Vergleich im Scan
+     * (scanReferrerItemIds) beidseitig konsistent ist.
      */
     private static function parseReferrerFilter(Request $request): array
     {
@@ -259,27 +259,6 @@ class ExternalArticleController extends Controller
             if ($norm !== null && $norm !== '') $out[$norm] = true;
         }
         return array_keys($out);
-    }
-
-    /**
-     * Prüft, ob ein (bereits serialisierter) Artikel mindestens eine der
-     * gewünschten Herkünfte trägt. Match über die Markt-Herkünfte ALLER Varianten
-     * (`variations[].markets[].referrer_id`) — ein Artikel gilt als Treffer, sobald
-     * eine Variante den Kanal führt.
-     */
-    private static function articleHasReferrer(array $article, array $wanted): bool
-    {
-        if (empty($wanted) || empty($article['variations'])) return false;
-        $wantedSet = array_flip($wanted);
-        foreach ($article['variations'] as $v) {
-            if (empty($v['markets'])) continue;
-            foreach ($v['markets'] as $m) {
-                if (isset($m['referrer_id']) && isset($wantedSet[$m['referrer_id']])) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     private static function loadArticlePage(
@@ -369,15 +348,17 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Lade-Pfad bei aktivem Herkunft-Filter. Da Plenty den serverseitigen
-     * `referrerId`-Suchparameter der Variations-Suche in dieser Version ignoriert,
-     * scannt der Server hier selbst alle Katalog-Seiten (über den normalen
-     * Lade-Pfad), filtert je Seite via articleHasReferrer() und liefert in EINEM
-     * Aufruf ALLE Treffer zurück — der Client muss nicht seitenweise loopen.
+     * Lade-Pfad bei aktivem Herkunft-Filter. Plenty ignoriert den serverseitigen
+     * `referrerId`-Suchparameter, daher zweiphasig:
+     *   1. LEICHTER Scan (scanReferrerItemIds) — pro Item-Seite nur IDs + Varianten
+     *      mit ausschließlich `variationMarkets` → Treffer-Item-IDs. Kein Volllast.
+     *   2. Nur die Treffer voll laden (Varianten in Chunks + Item via show()) und
+     *      serialisieren.
      *
-     * Kosten: interner Voll-Scan (so teuer wie ein Client-Loop, aber in einem
-     * Request gebündelt). `total_count` = Treffer-Anzahl. Sicherheitskappe bei
-     * MAX_SCAN_PAGES; wird sie erreicht, meldet `truncated: true`.
+     * Liefert in EINEM Aufruf ALLE Treffer (`total_count` = Treffer, kein Client-
+     * Loop). Bei sehr großen Katalogen greift MAX_SCAN_PAGES → `truncated: true`.
+     * Der teure Teil (V2-Eigenschaften/Preise/Serialisierung) fällt nur für die
+     * Treffer an, nicht für den ganzen Katalog.
      */
     private static function loadAllMatchingByReferrer(
         AuthHelper $authHelper,
@@ -388,33 +369,40 @@ class ExternalArticleController extends Controller
         array $referrerFilter,
         string $lang
     ): array {
-        $matches   = [];
-        $scanPage  = 1;
-        $truncated = false;
+        // Phase 1: LEICHTER Scan — nur variationMarkets laden, Treffer-Item-IDs sammeln.
+        $truncated      = false;
+        $matchedItemIds = self::scanReferrerItemIds(
+            $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
+        );
+        sort($matchedItemIds);
 
-        do {
-            // Normaler (ungefilterter) Lade-Pfad, Seite für Seite.
-            $loaded = self::loadArticlePage(
-                $authHelper, $itemRepository, $variationRepository,
-                $salesPriceRepository, $orderReferrerRepository,
-                $scanPage, self::MAX_PER_PAGE, $lang, []
-            );
-            foreach ($loaded['articles'] as $article) {
-                if (self::articleHasReferrer($article, $referrerFilter)) {
-                    $matches[] = $article;
+        // Phase 2: nur die Treffer voll laden (Varianten in Item-ID-Chunks).
+        $variationsByItemId = [];
+        foreach (array_chunk($matchedItemIds, self::MAX_PER_PAGE) as $chunk) {
+            foreach (self::loadVariationsByItemId($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
+                $variationsByItemId[$iid] = $vlist;
+            }
+        }
+        self::$currencyMap = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
+        self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
+
+        $articles = [];
+        foreach ($matchedItemIds as $itemId) {
+            $item = $authHelper->processUnguarded(function () use ($itemRepository, $itemId, $lang) {
+                try {
+                    return $itemRepository->show($itemId, [], $lang, self::itemRelations());
+                } catch (\Throwable $e) {
+                    return null;
                 }
-            }
-            $hasNext = !empty($loaded['pagination']['has_next_page']);
-            $scanPage++;
-            if ($scanPage > self::MAX_SCAN_PAGES) {
-                $truncated = $hasNext;
-                break;
-            }
-        } while ($hasNext);
+            });
+            if ($item === null) continue;
+            $vars = isset($variationsByItemId[$itemId]) ? $variationsByItemId[$itemId] : [];
+            $articles[] = self::serializeArticle($item, $lang, $vars);
+        }
 
-        $total = count($matches);
+        $total = count($articles);
         return [
-            'articles'   => $matches,
+            'articles'   => $articles,
             'pagination' => [
                 'page'           => 1,
                 'per_page'       => $total,
@@ -426,6 +414,78 @@ class ExternalArticleController extends Controller
             ],
             'truncated'  => $truncated,
         ];
+    }
+
+    /**
+     * Leichter Scan über den Katalog, der nur die Herkünfte prüft: pro Item-Seite
+     * werden bloß die Item-IDs geholt und die Varianten mit AUSSCHLIESSLICH der
+     * `variationMarkets`-Relation geladen (kein propertiesV2/Preise/etc.). Ein Item
+     * ist Treffer, sobald eine seiner Varianten eine gewünschte Herkunft
+     * (`variationMarkets.marketId`) führt.
+     *
+     * Das hält den Scan billig — die teure Volllast passiert danach nur für die
+     * Treffer. Sicherheitskappe MAX_SCAN_PAGES; `$truncated` wird true, wenn der
+     * Katalog dort abgeschnitten wurde.
+     */
+    private static function scanReferrerItemIds(
+        AuthHelper $authHelper,
+        ItemRepositoryContract $itemRepository,
+        VariationSearchRepositoryContract $variationRepository,
+        array $referrerFilter,
+        string $lang,
+        bool &$truncated
+    ): array {
+        $wantedSet = array_flip($referrerFilter);
+        $ids       = [];
+        $page      = 1;
+        $truncated = false;
+
+        do {
+            // Nur Item-IDs — minimales `with`/columns.
+            $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $lang) {
+                return $itemRepository->search([], [$lang], $page, self::MAX_PER_PAGE, []);
+            });
+            $entries     = $paginated->getResult();
+            $pageItemIds = [];
+            if (is_array($entries) || is_object($entries)) {
+                foreach ($entries as $it) {
+                    $id = self::asInt(self::pick($it, 'id'));
+                    if ($id !== null) $pageItemIds[] = $id;
+                }
+            }
+
+            if (!empty($pageItemIds)) {
+                $vars = $authHelper->processUnguarded(function () use ($variationRepository, $pageItemIds) {
+                    $variationRepository->setSearchParams(['with' => ['variationMarkets' => null]]);
+                    return $variationRepository->search(['itemIds' => $pageItemIds])->getResult();
+                });
+                if (is_array($vars) || is_object($vars)) {
+                    foreach ($vars as $v) {
+                        $itemId = self::asInt(self::prop($v, 'itemId'));
+                        if ($itemId === null || isset($ids[$itemId])) continue;
+                        $markets = self::prop($v, 'variationMarkets');
+                        if (!self::isIterable_($markets)) continue;
+                        foreach ($markets as $m) {
+                            $rid = self::referrerIdString(self::prop($m, 'marketId'));
+                            if ($rid !== null && isset($wantedSet[$rid])) {
+                                $ids[$itemId] = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            $arr     = $paginated->toArray();
+            $hasNext = is_array($arr) && isset($arr['isLastPage']) ? !((bool) $arr['isLastPage']) : false;
+            $page++;
+            if ($page > self::MAX_SCAN_PAGES) {
+                $truncated = $hasNext;
+                break;
+            }
+        } while ($hasNext);
+
+        return array_keys($ids);
     }
 
     /**
