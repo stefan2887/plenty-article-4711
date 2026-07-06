@@ -367,15 +367,14 @@ class ExternalArticleController extends Controller
 
     /**
      * Lade-Pfad bei aktivem Herkunft-Filter:
-     *   - Elastic-Suche mit `SkuFilter::hasMarketId()` liefert die Treffer-VARIATIONS-
-     *     Dokumente → Variations-IDs → Variationen direkt darüber laden (robust auch
-     *     bei ungewöhnlichen Item-IDs). Fallback: leichter Katalog-Scan.
-     *   - Treffer-Item-IDs ergeben sich aus den geladenen Variationen; je Item das
-     *     Item via show() laden und serialisieren.
+     *   - Elastic-Suche mit `SkuFilter::hasMarketId()` liefert die vollständigen
+     *     Treffer-VARIATIONS-Dokumente. Diese (u. a. TikTok-)Items liegen teils NUR
+     *     im Elastic-Index (Riesen-Item-IDs, von der comfortable-Suche nicht
+     *     auffindbar) — deshalb wird direkt AUS DEM ELASTIC-DOKUMENT serialisiert.
+     *   - Fällt die Elastic-Suche mit Exception aus, greift der Katalog-Scan-Fallback
+     *     (comfortable-Serialisierung) als Sicherheitsnetz.
      *
-     * Liefert in EINEM Aufruf ALLE Treffer (`total_count` = Treffer, kein Client-
-     * Loop). `filter_source` zeigt den genutzten Pfad. Der teure Teil (V2-Eigen-
-     * schaften/Preise/Serialisierung) fällt nur für die Treffer an.
+     * Liefert in EINEM Aufruf ALLE Treffer (`total_count` = Treffer, kein Client-Loop).
      */
     private static function loadAllMatchingByReferrer(
         AuthHelper $authHelper,
@@ -386,72 +385,31 @@ class ExternalArticleController extends Controller
         array $referrerFilter,
         string $lang
     ): array {
-        // Phase 1+2: Treffer bestimmen UND ihre Variationen laden.
-        // Bevorzugt echt serverseitig über die Elastic-Suche mit SkuFilter::hasMarketId().
-        // Die Elastic-Suche liefert VARIATIONS-Dokumente → wir ziehen die (kleinen,
-        // normalen) Variations-IDs und laden die Variationen DIREKT darüber. Das ist
-        // robust auch bei ungewöhnlichen/großen Item-IDs (TikTok-Import), bei denen
-        // ein Item-ID-Filter der Variations-Suche nichts findet.
-        // Nur bei einer Exception der Elastic-Suche auf den Katalog-Scan zurückfallen.
-        $truncated          = false;
-        $elasticOk          = false;
-        $variationsByItemId = [];
+        $truncated    = false;
+        $filterSource = 'elastic_sku_filter';
+        $articles     = [];
+
         try {
-            $variationIds = self::collectReferrerVariationIdsElastic($authHelper, $referrerFilter);
-            foreach (array_chunk($variationIds, self::MAX_PER_PAGE) as $chunk) {
-                foreach (self::loadVariationsByVariationIds($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
-                    $variationsByItemId[$iid] = isset($variationsByItemId[$iid])
-                        ? array_merge($variationsByItemId[$iid], $vlist)
-                        : $vlist;
-                }
+            // Elastic liefert die vollständigen Variations-Dokumente je Herkunft.
+            $docsByItem = self::collectReferrerDocsElastic($authHelper, $referrerFilter);
+            self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
+            foreach ($docsByItem as $docs) {
+                $articles[] = self::serializeElasticArticle($docs);
             }
             if (self::$debug) {
-                $vc = 0;
-                foreach ($variationsByItemId as $vl) { $vc += count($vl); }
-                self::$debugInfo['loaded_variations_count'] = $vc;
-                self::$debugInfo['loaded_item_ids']         = array_slice(array_keys($variationsByItemId), 0, 20);
+                self::$debugInfo['articles_built'] = count($articles);
             }
-            $elasticOk = true;
         } catch (\Throwable $e) {
-            $elasticOk = false;
             if (self::$debug) {
                 self::$debugInfo['elastic_exception'] = $e->getMessage();
             }
-        }
-
-        if ($elasticOk) {
-            $filterSource = 'elastic_sku_filter';
-        } else {
-            // Fallback: leichter Katalog-Scan → Treffer-Item-IDs → Varianten per Item-ID.
-            $filterSource   = 'scan_fallback';
-            $matchedItemIds = self::scanReferrerItemIds(
-                $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
+            // Fallback: leichter Katalog-Scan + comfortable-Serialisierung.
+            $filterSource = 'scan_fallback';
+            $articles     = self::loadMatchingViaScan(
+                $authHelper, $itemRepository, $variationRepository,
+                $salesPriceRepository, $orderReferrerRepository,
+                $referrerFilter, $lang, $truncated
             );
-            foreach (array_chunk($matchedItemIds, self::MAX_PER_PAGE) as $chunk) {
-                foreach (self::loadVariationsByItemId($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
-                    $variationsByItemId[$iid] = $vlist;
-                }
-            }
-        }
-
-        $matchedItemIds = array_keys($variationsByItemId);
-        sort($matchedItemIds);
-
-        self::$currencyMap = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
-        self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
-
-        $articles = [];
-        foreach ($matchedItemIds as $itemId) {
-            $item = $authHelper->processUnguarded(function () use ($itemRepository, $itemId, $lang) {
-                try {
-                    return $itemRepository->show($itemId, [], $lang, self::itemRelations());
-                } catch (\Throwable $e) {
-                    return null;
-                }
-            });
-            if ($item === null) continue;
-            $vars = isset($variationsByItemId[$itemId]) ? $variationsByItemId[$itemId] : [];
-            $articles[] = self::serializeArticle($item, $lang, $vars);
         }
 
         $total = count($articles);
@@ -472,18 +430,64 @@ class ExternalArticleController extends Controller
     }
 
     /**
-     * Bestimmt die Treffer-VARIATIONS-IDs ECHT serverseitig über die Elastic-Suche
-     * mit `SkuFilter::hasMarketId($referrer)` — Plenty/Elastic filtert auf die
-     * Verkaufskanal-/Herkunft-ID (Float, z. B. 11.04). Die Elastic-Suche liefert
-     * Variations-Dokumente; wir ziehen deren (kleine, normale) Variations-IDs, über
-     * die die Variationen anschließend zuverlässig geladen werden. Je Herkunft
-     * seitenweise, IDs vereinigt. Wirft bei API-Fehlern → Aufrufer fällt auf Scan zurück.
+     * Fallback-Pfad (Elastic-Exception): leichter Katalog-Scan → Treffer-Item-IDs →
+     * Varianten per Item-ID (comfortable-Suche) → Item via show() → serialisieren.
      */
-    private static function collectReferrerVariationIdsElastic(
+    private static function loadMatchingViaScan(
+        AuthHelper $authHelper,
+        ItemRepositoryContract $itemRepository,
+        VariationSearchRepositoryContract $variationRepository,
+        SalesPriceRepositoryContract $salesPriceRepository,
+        OrderReferrerRepositoryContract $orderReferrerRepository,
+        array $referrerFilter,
+        string $lang,
+        bool &$truncated
+    ): array {
+        $matchedItemIds = self::scanReferrerItemIds(
+            $authHelper, $itemRepository, $variationRepository, $referrerFilter, $lang, $truncated
+        );
+        $variationsByItemId = [];
+        foreach (array_chunk($matchedItemIds, self::MAX_PER_PAGE) as $chunk) {
+            foreach (self::loadVariationsByItemId($authHelper, $variationRepository, $chunk) as $iid => $vlist) {
+                $variationsByItemId[$iid] = $vlist;
+            }
+        }
+        self::$currencyMap = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
+        self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
+
+        $ids = array_keys($variationsByItemId);
+        sort($ids);
+        $articles = [];
+        foreach ($ids as $itemId) {
+            $item = $authHelper->processUnguarded(function () use ($itemRepository, $itemId, $lang) {
+                try {
+                    return $itemRepository->show($itemId, [], $lang, self::itemRelations());
+                } catch (\Throwable $e) {
+                    return null;
+                }
+            });
+            if ($item === null) continue;
+            $vars = isset($variationsByItemId[$itemId]) ? $variationsByItemId[$itemId] : [];
+            $articles[] = self::serializeArticle($item, $lang, $vars);
+        }
+        return $articles;
+    }
+
+    /**
+     * Holt die vollständigen Treffer-VARIATIONS-Dokumente serverseitig über die
+     * Elastic-Suche mit `SkuFilter::hasMarketId($referrer)` und gruppiert sie nach
+     * itemId: `[itemId => [doc, doc, …]]`. Die Dokumente enthalten bereits alle
+     * Daten (item, variation, barcodes, salesPrices, skus, texts, images,
+     * variationProperties) — daher wird direkt daraus serialisiert (die comfortable-
+     * Suche kennt diese Items z. T. gar nicht). Wirft bei API-Fehlern → Scan-Fallback.
+     */
+    private static function collectReferrerDocsElastic(
         AuthHelper $authHelper,
         array $referrerFilter
     ): array {
-        $ids = [];
+        $byItemId = [];
+        $firstDoc = null;
+        $docCount = 0;
         foreach ($referrerFilter as $refStr) {
             if (!is_numeric($refStr)) continue;
             $ref  = (float) $refStr;
@@ -498,12 +502,7 @@ class ExternalArticleController extends Controller
                     $search->addFilter($skuFilter);
 
                     $source = pluginApp(IncludeSource::class);
-                    if (self::$debug) {
-                        // Debug: alle Felder aktivieren, um die echte Dokument-Struktur zu sehen.
-                        $source->activateAll();
-                    } else {
-                        $source->activateList(['variation.id', 'variation.itemId', 'item.id']);
-                    }
+                    $source->activateAll();
                     $search->addSource($source);
                     $search->setPage($page, 1000);
 
@@ -517,77 +516,448 @@ class ExternalArticleController extends Controller
                     return is_array($result) ? $result : [];
                 });
 
-                if (self::$debug && !isset(self::$debugInfo['first_doc'])) {
-                    self::$debugInfo['elastic_doc_count'] = is_array($documents) ? count($documents) : 0;
-                    self::$debugInfo['first_doc'] = (is_array($documents) && isset($documents[0])) ? $documents[0] : null;
-                }
-
                 $count = 0;
                 if (is_array($documents)) {
                     foreach ($documents as $doc) {
                         $count++;
+                        $docCount++;
+                        if ($firstDoc === null) $firstDoc = $doc;
+                        $itemId      = self::extractItemIdFromElasticDoc($doc);
                         $variationId = self::extractVariationIdFromDoc($doc);
-                        if ($variationId !== null) $ids[$variationId] = true;
+                        if ($itemId === null || $variationId === null) continue;
+                        if (!isset($byItemId[$itemId])) $byItemId[$itemId] = [];
+                        $byItemId[$itemId][$variationId] = $doc; // dedup je Variations-ID
                     }
                 }
                 $page++;
             } while ($count >= 1000 && $page <= self::MAX_SCAN_PAGES);
         }
+
         if (self::$debug) {
-            self::$debugInfo['extracted_variation_ids_count']  = count($ids);
-            self::$debugInfo['extracted_variation_ids_sample'] = array_slice(array_keys($ids), 0, 20);
+            self::$debugInfo['elastic_doc_count']  = $docCount;
+            self::$debugInfo['elastic_item_count'] = count($byItemId);
+            self::$debugInfo['first_doc']          = $firstDoc;
         }
-        return array_keys($ids);
+
+        $out = [];
+        foreach ($byItemId as $itemId => $vmap) {
+            $out[$itemId] = array_values($vmap);
+        }
+        return $out;
     }
 
-    /**
-     * Zieht die Variations-ID tolerant aus einem Elastic-Ergebnis-Dokument. Das
-     * Format variiert je nach aktivierten Sources/Version — daher mehrere Pfade.
-     */
+    /** Item-ID aus einem Elastic-Dokument (data.variation.itemId bzw. data.item.id). */
+    private static function extractItemIdFromElasticDoc($doc): ?int
+    {
+        $data = self::edata($doc);
+        $id = self::eget($data, 'variation', 'itemId');
+        if ($id !== null) return self::asInt($id);
+        $id = self::eget($data, 'item', 'id');
+        return $id !== null ? self::asInt($id) : null;
+    }
+
+    /** Variations-ID aus einem Elastic-Dokument (data.variation.id bzw. Top-Level id). */
     private static function extractVariationIdFromDoc($doc): ?int
     {
-        if (!is_array($doc)) return null;
-        $data = isset($doc['data']) && is_array($doc['data']) ? $doc['data'] : $doc;
-
-        if (isset($data['variation']['id'])) return self::asInt($data['variation']['id']);
-        if (isset($data['id']))              return self::asInt($data['id']);
-        if (isset($doc['id']))               return self::asInt($doc['id']);
+        $data = self::edata($doc);
+        $id = self::eget($data, 'variation', 'id');
+        if ($id !== null) return self::asInt($id);
+        if (is_array($doc) && isset($doc['id'])) return self::asInt($doc['id']);
         return null;
     }
 
-    /**
-     * Lädt volle Variationen anhand einer Liste von Variations-IDs und gruppiert
-     * sie nach itemId. Sicherheitsfilter: nur angefragte IDs werden übernommen —
-     * so kann ein ignorierter `variationIds`-Param keine Fremd-Variationen einschleusen.
-     */
-    private static function loadVariationsByVariationIds(
-        AuthHelper $authHelper,
-        VariationSearchRepositoryContract $variationRepository,
-        array $variationIds
-    ): array {
-        if (empty($variationIds)) {
-            return [];
+    // ------------------------------------------------------------------
+    // Serialisierung DIREKT aus Elastic-Dokumenten (Herkunft-Filter-Pfad)
+    // ------------------------------------------------------------------
+
+    /** `$doc['data']` (bzw. das Dokument selbst), als Array. */
+    private static function edata($doc): array
+    {
+        if (!is_array($doc)) return [];
+        return (isset($doc['data']) && is_array($doc['data'])) ? $doc['data'] : $doc;
+    }
+
+    /** Sicherer verschachtelter Array-Zugriff: eget($arr, 'a', 'b') = $arr['a']['b'] ?? null. */
+    private static function eget($arr)
+    {
+        $keys = array_slice(func_get_args(), 1);
+        foreach ($keys as $k) {
+            if (!is_array($arr) || !array_key_exists($k, $arr)) return null;
+            $arr = $arr[$k];
         }
-        $wanted = array_flip($variationIds);
+        return $arr;
+    }
 
-        $rawVariations = $authHelper->processUnguarded(function () use ($variationRepository, $variationIds) {
-            $variationRepository->setSearchParams(['with' => self::variationRelations()]);
-            $result = $variationRepository->search(['variationIds' => $variationIds]);
-            return $result->getResult();
-        });
+    /** Baut einen Artikel aus den Variations-Dokumenten eines Items. */
+    private static function serializeElasticArticle(array $docs): array
+    {
+        $first = isset($docs[0]) ? $docs[0] : [];
+        $data  = self::edata($first);
+        $item  = is_array(self::eget($data, 'item')) ? $data['item'] : [];
+        $texts = is_array(self::eget($data, 'texts')) ? $data['texts'] : [];
 
-        $byItemId = [];
-        if (is_array($rawVariations) || is_object($rawVariations)) {
-            foreach ($rawVariations as $v) {
-                $vid = self::asInt(self::prop($v, 'id'));
-                if ($vid === null || !isset($wanted[$vid])) continue;
-                $itemId = self::asInt(self::prop($v, 'itemId'));
-                if ($itemId === null) continue;
-                if (!isset($byItemId[$itemId])) $byItemId[$itemId] = [];
-                $byItemId[$itemId][] = $v;
+        $variations = [];
+        foreach ($docs as $d) {
+            $variations[] = self::serializeElasticVariation($d);
+        }
+
+        return [
+            'id'               => self::asInt(self::eget($item, 'id')),
+            'position'         => self::asInt(self::eget($item, 'position')),
+            'manufacturer_id'  => self::asInt(self::eget($item, 'manufacturerId')),
+            'stock_limitation' => self::asInt(self::eget($item, 'stockLimitation')),
+            'store_special'    => self::asInt(self::eget($item, 'storeSpecial')),
+            'created_at'       => self::asIsoDate(self::eget($item, 'createdAt')),
+            'updated_at'       => self::asIsoDate(self::eget($item, 'updatedAt')),
+            'texts_by_lang'    => self::elasticTextsByLang($texts),
+            'primary_name'     => self::elasticPrimaryName($texts),
+            'images'           => self::elasticImages(self::eget($data, 'images')),
+            'variations'       => $variations,
+            'referrers'        => self::elasticReferrers($docs),
+        ];
+    }
+
+    /** Serialisiert eine Variante aus einem Elastic-Dokument (Schema wie serializeVariation). */
+    private static function serializeElasticVariation(array $doc): array
+    {
+        $data = self::edata($doc);
+        $v    = is_array(self::eget($data, 'variation')) ? $data['variation'] : [];
+
+        return [
+            'id'                    => self::asInt(self::eget($v, 'id')),
+            'item_id'               => self::asInt(self::eget($v, 'itemId')),
+            'number'                => self::asString(self::eget($v, 'number')),
+            'is_main'               => self::asBool(self::eget($v, 'isMain')),
+            'is_active'             => self::asBool(self::eget($v, 'isActive')),
+            'position'              => self::asInt(self::eget($v, 'position')),
+            'external_id'           => self::asString(self::eget($v, 'externalId')),
+            'model'                 => self::asString(self::eget($v, 'model')),
+            'vat_id'                => self::asInt(self::eget($v, 'vatId')),
+            'weight_g'              => self::asInt(self::eget($v, 'weightG')),
+            'weight_net_g'          => self::asInt(self::eget($v, 'weightNetG')),
+            'width_mm'              => self::asInt(self::eget($v, 'widthMM')),
+            'length_mm'             => self::asInt(self::eget($v, 'lengthMM')),
+            'height_mm'             => self::asInt(self::eget($v, 'heightMM')),
+            'packing_units'         => self::asInt(self::eget($v, 'packingUnits')),
+            'packing_unit_type_id'  => self::asInt(self::eget($v, 'packingUnitTypeId')),
+            'main_warehouse_id'     => self::asInt(self::eget($v, 'mainWarehouseId')),
+            'picking'               => self::asString(self::eget($v, 'picking')),
+            'stock_limitation'      => self::asInt(self::eget($v, 'stockLimitation')),
+            'released_at'           => self::asIsoDate(self::eget($v, 'releasedAt')),
+            'available_until'       => self::asIsoDate(self::eget($v, 'availableUntil')),
+            'created_at'            => self::asIsoDate(self::eget($v, 'createdAt')),
+            'updated_at'            => self::asIsoDate(self::eget($v, 'updatedAt')),
+            'prices'                => self::elasticPrices(self::eget($data, 'salesPrices')),
+            'stock'                 => self::elasticStock(self::eget($data, 'stock')),
+            'barcodes'              => self::elasticBarcodes(self::eget($data, 'barcodes')),
+            'categories'            => self::elasticCategories(self::eget($data, 'ids', 'categories')),
+            'properties'            => [],
+            'clients'               => self::elasticClients(self::eget($data, 'ids', 'clients')),
+            'markets'               => self::elasticMarkets(self::eget($data, 'skus')),
+            'properties_v2'         => self::elasticPropertiesV2(self::eget($data, 'variationProperties')),
+            'attribute_values'      => [],
+            'unit'                  => self::elasticUnit(self::eget($data, 'unit')),
+            'ean'                   => self::elasticEan(self::eget($data, 'barcodes')),
+            'tiktok_brand_id'       => self::elasticTiktokBrand(self::eget($data, 'variationProperties')),
+            'electronics_label_url' => self::elasticElectronicsUrl(self::eget($data, 'variationProperties')),
+        ];
+    }
+
+    private static function elasticTextsByLang($texts): array
+    {
+        if (!is_array($texts)) return [];
+        $out = [];
+        foreach ($texts as $t) {
+            if (!is_array($t)) continue;
+            $lang = self::asString(self::eget($t, 'lang'));
+            if ($lang === null || $lang === '') continue;
+            $out[$lang] = [
+                'name1'             => self::asString(self::eget($t, 'name1')),
+                'name2'             => self::asString(self::eget($t, 'name2')),
+                'name3'             => self::asString(self::eget($t, 'name3')),
+                'description'       => self::asString(self::eget($t, 'description')),
+                'short_description' => self::asString(self::eget($t, 'shortDescription')),
+                'technical_data'    => self::asString(self::eget($t, 'technicalData')),
+                'meta_keywords'     => self::asString(self::eget($t, 'keywords')),
+                'meta_description'  => self::asString(self::eget($t, 'metaDescription')),
+                'url_path'          => self::asString(self::eget($t, 'urlPath')),
+            ];
+        }
+        return $out;
+    }
+
+    private static function elasticPrimaryName($texts): ?string
+    {
+        $byLang = self::elasticTextsByLang($texts);
+        if (isset($byLang[self::$lang]['name1']) && $byLang[self::$lang]['name1'] !== null && $byLang[self::$lang]['name1'] !== '') {
+            return $byLang[self::$lang]['name1'];
+        }
+        foreach ($byLang as $entry) {
+            if (isset($entry['name1']) && $entry['name1'] !== null && $entry['name1'] !== '') return $entry['name1'];
+        }
+        return null;
+    }
+
+    private static function elasticImages($images): array
+    {
+        $all = self::eget($images, 'all');
+        if (!is_array($all)) return [];
+        $out = [];
+        foreach ($all as $img) {
+            if (!is_array($img)) continue;
+            $out[] = [
+                'id'          => self::asInt(self::eget($img, 'id')),
+                'position'    => self::asInt(self::eget($img, 'position')),
+                'type'        => self::asString(self::eget($img, 'type')),
+                'file_type'   => self::asString(self::eget($img, 'fileType')),
+                'path'        => self::asString(self::eget($img, 'path')),
+                'url'         => self::asString(self::eget($img, 'url')),
+                'url_preview' => self::asString(self::eget($img, 'urlPreview')),
+                'url_middle'  => self::asString(self::eget($img, 'urlMiddle')),
+            ];
+        }
+        return $out;
+    }
+
+    private static function elasticEan($barcodes): ?string
+    {
+        if (!is_array($barcodes)) return null;
+        foreach ($barcodes as $b) {
+            if (is_array($b) && self::asInt(self::eget($b, 'id')) === self::BARCODE_EAN_ID) {
+                $code = self::asString(self::eget($b, 'code'));
+                if ($code !== null && $code !== '') return $code;
             }
         }
-        return $byItemId;
+        return null;
+    }
+
+    private static function elasticBarcodes($barcodes): array
+    {
+        if (!is_array($barcodes)) return [];
+        $out = [];
+        foreach ($barcodes as $b) {
+            if (!is_array($b)) continue;
+            $out[] = [
+                'barcode_id' => self::asInt(self::eget($b, 'id')),
+                'code'       => self::asString(self::eget($b, 'code')),
+                'created_at' => self::asIsoDate(self::eget($b, 'createdAt')),
+            ];
+        }
+        return $out;
+    }
+
+    private static function elasticPrices($salesPrices): array
+    {
+        if (!is_array($salesPrices)) return [];
+        $out = [];
+        foreach ($salesPrices as $p) {
+            if (!is_array($p)) continue;
+            $out[] = [
+                'sales_price_id' => self::asInt(self::eget($p, 'id')),
+                'price'          => self::asFloat(self::eget($p, 'price')),
+                'currency'       => self::asString(self::eget($p, 'currency')),
+                'updated_at'     => self::asIsoDate(self::eget($p, 'updatedAt')),
+            ];
+        }
+        return $out;
+    }
+
+    private static function elasticStock($stock): array
+    {
+        if (!is_array($stock)) return [];
+        $net = self::eget($stock, 'net');
+        if ($net === null) return [];
+        return [[
+            'warehouse_id'   => null,
+            'stock_net'      => self::asFloat($net),
+            'physical_stock' => self::asFloat(self::eget($stock, 'physical')),
+            'reserved_stock' => self::asFloat(self::eget($stock, 'reserved')),
+            'updated_at'     => null,
+        ]];
+    }
+
+    private static function elasticMarkets($skus): array
+    {
+        if (!is_array($skus)) return [];
+        $out = [];
+        foreach ($skus as $s) {
+            if (!is_array($s)) continue;
+            $rid  = self::referrerIdString(self::eget($s, 'marketId'));
+            $info = ($rid !== null && isset(self::$referrerMap[$rid]))
+                ? self::$referrerMap[$rid]
+                : ['name' => null, 'backend_name' => null];
+            $out[] = [
+                'market_id'             => $rid,
+                'referrer_id'           => $rid,
+                'referrer_name'         => $info['name'],
+                'referrer_backend_name' => $info['backend_name'],
+                'sku'                   => self::asString(self::eget($s, 'sku')),
+                'initial_sku'           => self::asString(self::eget($s, 'initialSku')),
+            ];
+        }
+        return $out;
+    }
+
+    private static function elasticUnit($unit)
+    {
+        if (!is_array($unit)) return null;
+        return [
+            'unit_id' => self::asInt(self::eget($unit, 'id')),
+            'content' => self::asFloat(self::eget($unit, 'content')),
+        ];
+    }
+
+    private static function elasticCategories($categories): array
+    {
+        $all = self::eget($categories, 'all');
+        if (!is_array($all)) return [];
+        $out = [];
+        foreach ($all as $cid) {
+            $id = self::asInt($cid);
+            if ($id !== null) {
+                $out[] = ['category_id' => $id, 'plenty_id' => null, 'position' => null, 'is_default' => null];
+            }
+        }
+        return $out;
+    }
+
+    private static function elasticClients($clients): array
+    {
+        if (!is_array($clients)) return [];
+        $out = [];
+        foreach ($clients as $cid) {
+            $id = self::asInt($cid);
+            if ($id !== null) $out[] = ['plenty_id' => $id];
+        }
+        return $out;
+    }
+
+    /**
+     * Einzigartige Herkünfte der Hauptvariante (isMain) aus den Elastic-Dokumenten.
+     */
+    private static function elasticReferrers(array $docs): array
+    {
+        $seen = [];
+        $out  = [];
+        foreach ($docs as $doc) {
+            $data = self::edata($doc);
+            if (self::asBool(self::eget($data, 'variation', 'isMain')) !== true) continue;
+            $skus = self::eget($data, 'skus');
+            if (!is_array($skus)) continue;
+            foreach ($skus as $s) {
+                $rid = self::referrerIdString(self::eget($s, 'marketId'));
+                if ($rid === null || isset($seen[$rid])) continue;
+                $seen[$rid] = true;
+                $info = isset(self::$referrerMap[$rid]) ? self::$referrerMap[$rid] : ['name' => null, 'backend_name' => null];
+                $out[] = ['id' => $rid, 'name' => $info['name'], 'backend_name' => $info['backend_name']];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * V2-Eigenschaften aus der Elastic-`variationProperties`-Struktur. Jeder Eintrag:
+     * `{property_id, name, cast, value, texts, selections}`. Die Werte liegen in
+     * `values[]` (mit lang/value/description/selectionId), die Meta in `property`.
+     */
+    private static function elasticPropertiesV2($variationProperties): array
+    {
+        if (!is_array($variationProperties)) return [];
+        $out = [];
+        foreach ($variationProperties as $entry) {
+            if (!is_array($entry)) continue;
+            $parsed = self::elasticParseProperty($entry);
+            $out[] = [
+                'property_id' => $parsed['property_id'],
+                'name'        => $parsed['name'],
+                'cast'        => $parsed['cast'],
+                'value'       => $parsed['value'],
+                'texts'       => $parsed['texts'],
+                'selections'  => $parsed['selections'],
+            ];
+        }
+        return $out;
+    }
+
+    /** Zerlegt einen Elastic-variationProperties-Eintrag in property_id/name/cast/value/texts/selections. */
+    private static function elasticParseProperty(array $entry): array
+    {
+        $prop  = is_array(self::eget($entry, 'property')) ? $entry['property'] : [];
+        $cast  = self::asString(self::eget($prop, 'cast'));
+        $names = is_array(self::eget($prop, 'names')) ? $prop['names'] : [];
+
+        $propertyId = null;
+        $name       = null;
+        foreach ($names as $n) {
+            if (!is_array($n)) continue;
+            if ($propertyId === null) {
+                $propertyId = self::asInt(self::eget($n, 'propertyId'));
+                $name       = self::asString(self::eget($n, 'name'));
+            }
+            if (self::asString(self::eget($n, 'lang')) === self::$lang) {
+                $propertyId = self::asInt(self::eget($n, 'propertyId'));
+                $name       = self::asString(self::eget($n, 'name'));
+                break;
+            }
+        }
+
+        $values     = is_array(self::eget($entry, 'values')) ? $entry['values'] : [];
+        $value      = null;
+        $firstValue = null;
+        $texts      = [];
+        $selections = [];
+        foreach ($values as $val) {
+            if (!is_array($val)) continue;
+            $vLang = self::asString(self::eget($val, 'lang'));
+            $vVal  = self::asString(self::eget($val, 'value'));
+            $selId = self::asInt(self::eget($val, 'selectionId'));
+            if ($firstValue === null) $firstValue = $vVal;
+            if ($vLang !== null && $vLang !== '') $texts[$vLang] = $vVal;
+            $selections[] = [
+                'selection_id' => $selId,
+                'name'         => $vVal,
+                'description'  => self::asString(self::eget($val, 'description')),
+            ];
+            if ($vLang === self::$lang && $value === null) $value = $vVal;
+        }
+        if ($value === null) $value = $firstValue;
+
+        return [
+            'property_id' => $propertyId,
+            'name'        => $name,
+            'cast'        => $cast,
+            'value'       => $value,
+            'texts'       => $texts,
+            'selections'  => $selections,
+        ];
+    }
+
+    /** TikTok-Marken-ID: V2-Eigenschaft vom Typ Auswahl, deren Name „Marke" enthält. */
+    private static function elasticTiktokBrand($variationProperties): ?string
+    {
+        if (!is_array($variationProperties)) return null;
+        foreach ($variationProperties as $entry) {
+            if (!is_array($entry)) continue;
+            $p = self::elasticParseProperty($entry);
+            if ($p['name'] !== null && stripos($p['name'], 'marke') !== false) {
+                if ($p['value'] !== null && $p['value'] !== '') return $p['value'];
+            }
+        }
+        return null;
+    }
+
+    /** Elektro-Kennzeichnungs-PDF: V2-Eigenschaft, deren Name „Kennzeichnung" enthält. */
+    private static function elasticElectronicsUrl($variationProperties): ?string
+    {
+        if (!is_array($variationProperties)) return null;
+        foreach ($variationProperties as $entry) {
+            if (!is_array($entry)) continue;
+            $p = self::elasticParseProperty($entry);
+            if ($p['name'] !== null && stripos($p['name'], 'kennzeichnung') !== false) {
+                if ($p['value'] !== null && $p['value'] !== '') return $p['value'];
+            }
+        }
+        return null;
     }
 
     /**
