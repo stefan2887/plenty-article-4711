@@ -64,6 +64,10 @@ class ExternalArticleController extends Controller
      */
     private static $lang = 'de';
 
+    /** Debug-Modus (?debug=1) + gesammelte Diagnose-Infos für den Herkunft-Filter. */
+    private static $debug = false;
+    private static $debugInfo = [];
+
     /**
      * Eager-Load-Liste für den Item-Load (Schritt 1).
      * Variations werden separat in Schritt 2 via VariationSearchRepositoryContract
@@ -121,6 +125,9 @@ class ExternalArticleController extends Controller
 
         list($page, $perPage, $lang) = self::parsePagination($request);
 
+        self::$debug     = ((string) $request->get('debug', '')) !== '';
+        self::$debugInfo = [];
+
         // Optionaler Herkunft-Filter: ?referrer_id=11.04 (mehrere per Komma).
         // Treffer werden serverseitig via Elastic-SkuFilter bestimmt (Fallback: Scan);
         // es werden nur Treffer-Artikel geladen, `total_count` = Treffer-Anzahl.
@@ -152,6 +159,9 @@ class ExternalArticleController extends Controller
             if (!empty($loaded['truncated'])) {
                 $filterMeta['filter_truncated'] = true;
                 $filterMeta['filter_scan_page_cap'] = self::MAX_SCAN_PAGES;
+            }
+            if (self::$debug) {
+                $filterMeta['debug'] = self::$debugInfo;
             }
             $result['filter'] = ['referrer_id' => $referrerFilter];
             $result['meta']   = $meta + $filterMeta;
@@ -395,9 +405,18 @@ class ExternalArticleController extends Controller
                         : $vlist;
                 }
             }
+            if (self::$debug) {
+                $vc = 0;
+                foreach ($variationsByItemId as $vl) { $vc += count($vl); }
+                self::$debugInfo['loaded_variations_count'] = $vc;
+                self::$debugInfo['loaded_item_ids']         = array_slice(array_keys($variationsByItemId), 0, 20);
+            }
             $elasticOk = true;
         } catch (\Throwable $e) {
             $elasticOk = false;
+            if (self::$debug) {
+                self::$debugInfo['elastic_exception'] = $e->getMessage();
+            }
         }
 
         if ($elasticOk) {
@@ -479,7 +498,12 @@ class ExternalArticleController extends Controller
                     $search->addFilter($skuFilter);
 
                     $source = pluginApp(IncludeSource::class);
-                    $source->activateList(['variation.id', 'variation.itemId', 'item.id']);
+                    if (self::$debug) {
+                        // Debug: alle Felder aktivieren, um die echte Dokument-Struktur zu sehen.
+                        $source->activateAll();
+                    } else {
+                        $source->activateList(['variation.id', 'variation.itemId', 'item.id']);
+                    }
                     $search->addSource($source);
                     $search->setPage($page, 1000);
 
@@ -493,6 +517,11 @@ class ExternalArticleController extends Controller
                     return is_array($result) ? $result : [];
                 });
 
+                if (self::$debug && !isset(self::$debugInfo['first_doc'])) {
+                    self::$debugInfo['elastic_doc_count'] = is_array($documents) ? count($documents) : 0;
+                    self::$debugInfo['first_doc'] = (is_array($documents) && isset($documents[0])) ? $documents[0] : null;
+                }
+
                 $count = 0;
                 if (is_array($documents)) {
                     foreach ($documents as $doc) {
@@ -503,6 +532,10 @@ class ExternalArticleController extends Controller
                 }
                 $page++;
             } while ($count >= 1000 && $page <= self::MAX_SCAN_PAGES);
+        }
+        if (self::$debug) {
+            self::$debugInfo['extracted_variation_ids_count']  = count($ids);
+            self::$debugInfo['extracted_variation_ids_sample'] = array_slice(array_keys($ids), 0, 20);
         }
         return array_keys($ids);
     }
