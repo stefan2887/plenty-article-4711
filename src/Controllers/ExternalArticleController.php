@@ -393,6 +393,11 @@ class ExternalArticleController extends Controller
             // Elastic liefert die vollständigen Variations-Dokumente je Herkunft.
             $docsByItem = self::collectReferrerDocsElastic($authHelper, $referrerFilter);
             self::$referrerMap = self::loadReferrerMap($authHelper, $orderReferrerRepository);
+            // Währung nachziehen: Elastic-Preise haben kein currency-Feld → über die
+            // SalesPrice-IDs auflösen (SalesPriceRepository), von elasticPrices genutzt.
+            self::$currencyMap = self::loadCurrencyMapForIds(
+                $authHelper, $salesPriceRepository, self::collectElasticSalesPriceIds($docsByItem)
+            );
             foreach ($docsByItem as $docs) {
                 $articles[] = self::serializeElasticArticle($docs);
             }
@@ -621,6 +626,7 @@ class ExternalArticleController extends Controller
     {
         $data = self::edata($doc);
         $v    = is_array(self::eget($data, 'variation')) ? $data['variation'] : [];
+        $hash = self::elasticStorageHash($data);
 
         return [
             'id'                    => self::asInt(self::eget($v, 'id')),
@@ -653,12 +659,12 @@ class ExternalArticleController extends Controller
             'properties'            => [],
             'clients'               => self::elasticClients(self::eget($data, 'ids', 'clients')),
             'markets'               => self::elasticMarkets(self::eget($data, 'skus')),
-            'properties_v2'         => self::elasticPropertiesV2(self::eget($data, 'variationProperties')),
+            'properties_v2'         => self::elasticPropertiesV2(self::eget($data, 'variationProperties'), $hash),
             'attribute_values'      => [],
             'unit'                  => self::elasticUnit(self::eget($data, 'unit')),
             'ean'                   => self::elasticEan(self::eget($data, 'barcodes')),
             'tiktok_brand_id'       => self::elasticTiktokBrand(self::eget($data, 'variationProperties')),
-            'electronics_label_url' => self::elasticElectronicsUrl(self::eget($data, 'variationProperties')),
+            'electronics_label_url' => self::elasticElectronicsUrl(self::eget($data, 'variationProperties'), $hash),
         ];
     }
 
@@ -751,10 +757,16 @@ class ExternalArticleController extends Controller
         $out = [];
         foreach ($salesPrices as $p) {
             if (!is_array($p)) continue;
+            $spId     = self::asInt(self::eget($p, 'id'));
+            // Elastic-Preise haben kein currency-Feld — über die vorgeladene
+            // Currency-Map (SalesPrice-ID → Währung) nachziehen.
+            $currency = ($spId !== null && isset(self::$currencyMap[$spId]))
+                ? self::$currencyMap[$spId]
+                : null;
             $out[] = [
-                'sales_price_id' => self::asInt(self::eget($p, 'id')),
+                'sales_price_id' => $spId,
                 'price'          => self::asFloat(self::eget($p, 'price')),
-                'currency'       => self::asString(self::eget($p, 'currency')),
+                'currency'       => $currency,
                 'updated_at'     => self::asIsoDate(self::eget($p, 'updatedAt')),
             ];
         }
@@ -859,18 +871,23 @@ class ExternalArticleController extends Controller
      * `{property_id, name, cast, value, texts, selections}`. Die Werte liegen in
      * `values[]` (mit lang/value/description/selectionId), die Meta in `property`.
      */
-    private static function elasticPropertiesV2($variationProperties): array
+    private static function elasticPropertiesV2($variationProperties, ?string $hash = null): array
     {
         if (!is_array($variationProperties)) return [];
         $out = [];
         foreach ($variationProperties as $entry) {
             if (!is_array($entry)) continue;
             $parsed = self::elasticParseProperty($entry);
+            $value  = $parsed['value'];
+            // Datei-Eigenschaften: relativen Pfad zur vollen URL auflösen.
+            if ($parsed['cast'] === 'file') {
+                $value = self::elasticFileUrl($value, $hash);
+            }
             $out[] = [
                 'property_id' => $parsed['property_id'],
                 'name'        => $parsed['name'],
                 'cast'        => $parsed['cast'],
-                'value'       => $parsed['value'],
+                'value'       => $value,
                 'texts'       => $parsed['texts'],
                 'selections'  => $parsed['selections'],
             ];
@@ -938,25 +955,67 @@ class ExternalArticleController extends Controller
         foreach ($variationProperties as $entry) {
             if (!is_array($entry)) continue;
             $p = self::elasticParseProperty($entry);
-            if ($p['name'] !== null && stripos($p['name'], 'marke') !== false) {
+            if ($p['name'] !== null && strpos($p['name'], 'Marke') !== false) {
                 if ($p['value'] !== null && $p['value'] !== '') return $p['value'];
             }
         }
         return null;
     }
 
-    /** Elektro-Kennzeichnungs-PDF: V2-Eigenschaft, deren Name „Kennzeichnung" enthält. */
-    private static function elasticElectronicsUrl($variationProperties): ?string
+    /** Elektro-Kennzeichnungs-Datei: V2-Eigenschaft, deren Name „Kennzeichnung" enthält → volle URL. */
+    private static function elasticElectronicsUrl($variationProperties, ?string $hash = null): ?string
     {
         if (!is_array($variationProperties)) return null;
         foreach ($variationProperties as $entry) {
             if (!is_array($entry)) continue;
             $p = self::elasticParseProperty($entry);
-            if ($p['name'] !== null && stripos($p['name'], 'kennzeichnung') !== false) {
-                if ($p['value'] !== null && $p['value'] !== '') return $p['value'];
+            if ($p['name'] !== null && strpos($p['name'], 'Kennzeichnung') !== false) {
+                if ($p['value'] !== null && $p['value'] !== '') {
+                    return self::elasticFileUrl($p['value'], $hash);
+                }
             }
         }
         return null;
+    }
+
+    /**
+     * Storage-Hash des Systems aus einer Bild-URL des Dokuments ziehen
+     * (`https://cdn02.plentyone.com/<hash>/item/images/…`). Wird für die
+     * Property-Datei-URLs gebraucht (dieselbe Storage-Kennung). `null`, wenn
+     * kein Bild/keine URL vorhanden.
+     */
+    private static function elasticStorageHash($data): ?string
+    {
+        $all = self::eget($data, 'images', 'all');
+        if (!is_array($all)) return null;
+        foreach ($all as $img) {
+            if (!is_array($img)) continue;
+            $url = self::asString(self::eget($img, 'url'));
+            if ($url === null || $url === '') continue;
+            $parts = explode('/', $url);
+            // [0]=https: [1]='' [2]=<host> [3]=<hash> …
+            if (count($parts) >= 4 && strpos($parts[2], 'plentyone.com') !== false && $parts[3] !== '') {
+                return $parts[3];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Baut aus einem gespeicherten Property-Datei-Wert die öffentliche URL.
+     * - Ist der Wert bereits eine volle URL (http/https, z. B. auf anderen
+     *   Systemen), wird er unverändert durchgereicht.
+     * - Sonst wird der relative Pfad (`<valueId>/<datei>`) mit dem S3-Basis-Pfad
+     *   `…/plentymarkets-public-92/<hash>/propertyItems/` präfixiert.
+     * - Ohne Hash bleibt der rohe Pfad erhalten (kein Basis-Pfad ableitbar).
+     */
+    private static function elasticFileUrl(?string $rel, ?string $hash): ?string
+    {
+        if ($rel === null || $rel === '') return null;
+        if (strpos($rel, 'http://') === 0 || strpos($rel, 'https://') === 0) return $rel;
+        if ($hash === null || $hash === '') return $rel;
+        return 'https://s3-eu-central-1.amazonaws.com/plentymarkets-public-92/'
+            . $hash . '/propertyItems/' . $rel;
     }
 
     /**
@@ -1081,6 +1140,62 @@ class ExternalArticleController extends Controller
             }
         }
         return $byId;
+    }
+
+    /**
+     * Wie loadCurrencyMap(), aber direkt aus einer Liste von SalesPrice-IDs — für
+     * den Elastic-Pfad, dessen Preis-Dokumente keine Währung enthalten.
+     */
+    private static function loadCurrencyMapForIds(
+        AuthHelper $authHelper,
+        SalesPriceRepositoryContract $salesPriceRepository,
+        array $salesPriceIds
+    ): array {
+        $uniqueIds = [];
+        foreach ($salesPriceIds as $id) {
+            $i = self::asInt($id);
+            if ($i !== null) $uniqueIds[$i] = true;
+        }
+        if (empty($uniqueIds)) {
+            return [];
+        }
+
+        $rawSalesPrices = $authHelper->processUnguarded(function () use ($salesPriceRepository, $uniqueIds) {
+            $raw = [];
+            foreach (array_keys($uniqueIds) as $id) {
+                $sp = $salesPriceRepository->findById($id);
+                if ($sp !== null) $raw[$id] = $sp;
+            }
+            return $raw;
+        });
+
+        $byId = [];
+        if (is_array($rawSalesPrices)) {
+            foreach ($rawSalesPrices as $id => $sp) {
+                $currency = self::prop($sp, 'currency');
+                if (is_string($currency) && $currency !== '') {
+                    $byId[(int) $id] = $currency;
+                }
+            }
+        }
+        return $byId;
+    }
+
+    /** Sammelt einzigartige SalesPrice-IDs aus den Elastic-Dokumenten (data.salesPrices[].id). */
+    private static function collectElasticSalesPriceIds(array $docsByItem): array
+    {
+        $ids = [];
+        foreach ($docsByItem as $docs) {
+            foreach ($docs as $doc) {
+                $sp = self::eget(self::edata($doc), 'salesPrices');
+                if (!is_array($sp)) continue;
+                foreach ($sp as $p) {
+                    $id = self::asInt(self::eget($p, 'id'));
+                    if ($id !== null) $ids[$id] = true;
+                }
+            }
+        }
+        return array_keys($ids);
     }
 
     /**
