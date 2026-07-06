@@ -112,7 +112,13 @@ class ExternalArticleController extends Controller
         if ($authErr !== null) return $authErr;
 
         list($page, $perPage, $lang) = self::parsePagination($request);
-        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang);
+
+        // Optionaler Herkunft-Filter: ?referrer_id=11.04 (mehrere per Komma).
+        // Bei gesetztem Filter treibt die herkunft-gefilterte Variations-Suche das
+        // Laden — es werden nur Treffer-Artikel geladen (nicht der ganze Katalog),
+        // und `total_count` = Treffer-Anzahl.
+        $referrerFilter = self::parseReferrerFilter($request);
+        $loaded = self::loadArticlePage($authHelper, $itemRepository, $variationRepository, $salesPriceRepository, $orderReferrerRepository, $page, $perPage, $lang, $referrerFilter);
 
         $articles   = $loaded['articles'];
         $pagination = $loaded['pagination'];
@@ -123,15 +129,15 @@ class ExternalArticleController extends Controller
             'schema_version'       => self::SCHEMA_VERSION,
         ];
 
-        // Optionaler Herkunft-Filter: ?referrer_id=11.04 (mehrere per Komma).
-        // Post-Load im PHP — dieselbe Semantik wie by-marking (siehe README).
-        $referrerFilter = self::parseReferrerFilter($request);
         $result = [
             'data'       => $articles,
             'pagination' => $pagination,
             'meta'       => $meta,
         ];
         if (!empty($referrerFilter)) {
+            // Korrektheits-Gate: sollte die Plenty-Suche den Herkunft-Filter mal
+            // nicht anwenden, filtert dieser Post-Load-Schritt trotzdem sauber.
+            // Im Normalfall (Suche filtert bereits) ist das ein No-op.
             $filtered = [];
             foreach ($articles as $article) {
                 if (self::articleHasReferrer($article, $referrerFilter)) {
@@ -142,7 +148,7 @@ class ExternalArticleController extends Controller
             $result['data']       = $filtered;
             $result['pagination'] = $pagination;
             $result['filter']     = ['referrer_id' => $referrerFilter];
-            $result['meta']       = $meta + ['filter_applied' => 'post_load_php'];
+            $result['meta']       = $meta + ['filter_applied' => 'plenty_referrer_search'];
         }
 
         return $response->json($result, 200);
@@ -286,12 +292,22 @@ class ExternalArticleController extends Controller
         OrderReferrerRepositoryContract $orderReferrerRepository,
         int $page,
         int $perPage,
-        string $lang
+        string $lang,
+        array $referrerFilter = []
     ): array {
         // Per-Request-Reset der Caches + Sprache.
         self::$currencyMap = [];
         self::$referrerMap = [];
         self::$lang        = $lang;
+
+        // Bei aktivem Herkunft-Filter treibt die Variations-Suche das Laden.
+        if (!empty($referrerFilter)) {
+            return self::loadArticlePageByReferrer(
+                $authHelper, $itemRepository, $variationRepository,
+                $salesPriceRepository, $orderReferrerRepository,
+                $referrerFilter, $page, $perPage, $lang
+            );
+        }
 
         // Schritt 1: Items paginieren (Item-Pagination bleibt der Konsumenten-Vertrag).
         $paginated = $authHelper->processUnguarded(function () use ($itemRepository, $page, $perPage, $lang) {
@@ -351,6 +367,122 @@ class ExternalArticleController extends Controller
                 'has_next_page'  => $isLastPage === null ? null : ! $isLastPage,
             ],
         ];
+    }
+
+    /**
+     * Effizienter Lade-Pfad bei aktivem Herkunft-Filter: statt den ganzen Katalog
+     * zu paginieren, treibt die herkunft-gefilterte Variations-Suche das Laden.
+     *
+     *   1. Über alle angefragten Herkünfte die Treffer-Item-IDs sammeln
+     *      (server-seitig gefiltert, `collectReferrerItemIds`).
+     *   2. Item-basiert paginieren (`total_count` = Treffer-Anzahl).
+     *   3. Nur die Artikel dieser Seite voll laden (Item via show() + alle
+     *      Varianten des Items via loadVariationsByItemId).
+     *
+     * Ein Artikel erscheint mit ALLEN seinen Varianten (nicht nur den
+     * herkunft-tragenden) — der Herkunft-Filter entscheidet nur, WELCHE Artikel
+     * geliefert werden.
+     */
+    private static function loadArticlePageByReferrer(
+        AuthHelper $authHelper,
+        ItemRepositoryContract $itemRepository,
+        VariationSearchRepositoryContract $variationRepository,
+        SalesPriceRepositoryContract $salesPriceRepository,
+        OrderReferrerRepositoryContract $orderReferrerRepository,
+        array $referrerFilter,
+        int $page,
+        int $perPage,
+        string $lang
+    ): array {
+        // 1. Treffer-Item-IDs (dedupliziert, stabil sortiert).
+        $matchedItemIds = self::collectReferrerItemIds($authHelper, $variationRepository, $referrerFilter);
+        sort($matchedItemIds);
+
+        $total    = count($matchedItemIds);
+        $lastPage = $perPage > 0 ? (int) ceil($total / $perPage) : 1;
+        if ($lastPage < 1) $lastPage = 1;
+
+        // 2. Item-basierte Seite herausschneiden.
+        $offset  = ($page - 1) * $perPage;
+        $pageIds = ($offset >= 0 && $offset < $total) ? array_slice($matchedItemIds, $offset, $perPage) : [];
+
+        // 3. Volle Varianten + Maps für genau diese Items.
+        $variationsByItemId = self::loadVariationsByItemId($authHelper, $variationRepository, $pageIds);
+        self::$currencyMap  = self::loadCurrencyMap($authHelper, $salesPriceRepository, $variationsByItemId);
+        self::$referrerMap  = self::loadReferrerMap($authHelper, $orderReferrerRepository);
+
+        // 4. Items einzeln laden (show) + serialisieren.
+        $articles = [];
+        foreach ($pageIds as $itemId) {
+            $item = $authHelper->processUnguarded(function () use ($itemRepository, $itemId, $lang) {
+                try {
+                    return $itemRepository->show($itemId, [], $lang, self::itemRelations());
+                } catch (\Throwable $e) {
+                    return null;
+                }
+            });
+            if ($item === null) continue;
+            $vars = isset($variationsByItemId[$itemId]) ? $variationsByItemId[$itemId] : [];
+            $articles[] = self::serializeArticle($item, $lang, $vars);
+        }
+
+        return [
+            'articles'   => $articles,
+            'pagination' => [
+                'page'           => $page,
+                'per_page'       => $perPage,
+                'returned_count' => count($articles),
+                'total_count'    => $total,
+                'last_page'      => $lastPage,
+                'is_last_page'   => $page >= $lastPage,
+                'has_next_page'  => $page < $lastPage,
+            ],
+        ];
+    }
+
+    /**
+     * Sammelt die Treffer-Item-IDs für eine Liste von Herkünften über die
+     * server-seitig gefilterte Variations-Suche (`referrerId`-Param). Läuft je
+     * Herkunft durch alle Seiten (bis `isLastPage`) und vereinigt die Item-IDs.
+     * Minimales `with` — es werden nur die Item-IDs gebraucht.
+     *
+     * Sicherheitskappe bei 500 Seiten pro Herkunft, damit ein ignorierter
+     * Pagination-Parameter keine Endlosschleife auslöst.
+     */
+    private static function collectReferrerItemIds(
+        AuthHelper $authHelper,
+        VariationSearchRepositoryContract $variationRepository,
+        array $referrerFilter
+    ): array {
+        $ids = [];
+        foreach ($referrerFilter as $refStr) {
+            if (!is_numeric($refStr)) continue;
+            $ref  = (float) $refStr;
+            $page = 1;
+            do {
+                $chunk = $authHelper->processUnguarded(function () use ($variationRepository, $ref, $page) {
+                    $variationRepository->setSearchParams(['with' => []]);
+                    return $variationRepository->search([
+                        'referrerId'   => $ref,
+                        'page'         => $page,
+                        'itemsPerPage' => 200,
+                    ]);
+                });
+
+                $rows = $chunk->getResult();
+                if (is_array($rows) || is_object($rows)) {
+                    foreach ($rows as $v) {
+                        $itemId = self::asInt(self::prop($v, 'itemId'));
+                        if ($itemId !== null) $ids[$itemId] = true;
+                    }
+                }
+
+                $arr    = $chunk->toArray();
+                $isLast = is_array($arr) && isset($arr['isLastPage']) ? (bool) $arr['isLastPage'] : true;
+                $page++;
+            } while (!$isLast && $page <= 500);
+        }
+        return array_keys($ids);
     }
 
     /**

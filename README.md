@@ -49,7 +49,7 @@ Beide brauchen den Header `X-Api-Key`, akzeptieren die gleichen Query-Parameter 
 | `page` | `1` | — | 1-basierte Seite |
 | `per_page` | `50` | `200` | Items pro Seite (hartes Maximum: 200) |
 | `lang` | `de` | — | Bevorzugte Sprache für `primary_name`; `texts_by_lang` enthält alle verfügbaren Sprachen |
-| `referrer_id` | — | — | **Herkunft-Filter.** Nur Artikel, die die angegebene(n) Herkunft/-künfte führen. Mehrere per Komma, z. B. `?referrer_id=11.04,1,104`. Match, wenn **irgendeine** Variante des Artikels die Herkunft in `variations[].markets[].referrer_id` trägt. Post-Load-Filter (siehe Pagination-Hinweis bei `by-marking`). Bei aktivem Filter enthält die Antwort einen `filter`-Block und `meta.filter_applied`. |
+| `referrer_id` | — | — | **Herkunft-Filter (nur `/articles`).** Nur Artikel, die die angegebene(n) Herkunft/-künfte führen. Mehrere per Komma, z. B. `?referrer_id=11.04,1,104`. Match, wenn **irgendeine** Variante die Herkunft trägt. **Server-seitig** über die herkunft-gefilterte Variations-Suche — es werden nur die Treffer-Artikel geladen, nicht der ganze Katalog, und `total_count` = **Treffer-Anzahl** (item-basierte Paginierung). Antwort enthält dann `filter` + `meta.filter_applied: "plenty_referrer_search"`. |
 
 **Route-Parameter (nur `by-marking`):**
 
