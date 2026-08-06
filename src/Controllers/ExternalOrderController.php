@@ -191,6 +191,9 @@ class ExternalOrderController extends Controller
      *   - `referrer_id`          → korrigiert die Herkunft (Top-Level `referrerId`),
      *                              z. B. wenn eine Order mit falscher Herkunft
      *                              angelegt wurde. Nur wenn explizit übergeben.
+     *   - `payment_method_id`    → setzt die Zahlart des Auftrags (Order-Property
+     *                              typeId 3). Nur wenn explizit übergeben; legt
+     *                              KEINE Zahlung an (dafür `payment`/`payments`).
      *   - `payment` / `payments` → legt eine ODER mehrere Zahlungen an und verknüpft
      *                              sie mit der Order (gleiche Logik wie bei create()).
      *
@@ -261,6 +264,24 @@ class ExternalOrderController extends Controller
             } catch (\Throwable $e) {
                 return self::jsonError($response, $request, 'referrer_update_failed',
                     'Herkunfts-Update in Plenty fehlgeschlagen: ' . $e->getMessage(), 500);
+            }
+        }
+
+        // ---- 2c. Zahlart (Order-Property typeId 3) setzen ----------------
+        if (isset($payload['payment_method_id']) && $payload['payment_method_id'] !== '') {
+            $newMethod = (int) $payload['payment_method_id'];
+            try {
+                $authHelper->processUnguarded(function () use ($orderRepository, $orderId, $newMethod) {
+                    return $orderRepository->updateOrder([
+                        'properties' => [
+                            ['typeId' => self::PROP_PAYMENT_METHOD, 'value' => (string) $newMethod],
+                        ],
+                    ], $orderId);
+                });
+                $applied['payment_method_id'] = $newMethod;
+            } catch (\Throwable $e) {
+                return self::jsonError($response, $request, 'payment_method_update_failed',
+                    'Zahlart-Update in Plenty fehlgeschlagen: ' . $e->getMessage(), 500);
             }
         }
 
@@ -376,17 +397,21 @@ class ExternalOrderController extends Controller
     {
         $hasStatus = isset($p['status_id']) && $p['status_id'] !== '';
         $hasReferrer = isset($p['referrer_id']) && $p['referrer_id'] !== '';
+        $hasMethod = isset($p['payment_method_id']) && $p['payment_method_id'] !== '';
         $payments  = self::normalizePaymentsInput($p);
         $hasPayments = !empty($payments);
 
-        if (!$hasStatus && !$hasReferrer && !$hasPayments) {
-            return 'Nichts zu aktualisieren: mindestens `status_id`, `referrer_id` oder `payment`/`payments` angeben.';
+        if (!$hasStatus && !$hasReferrer && !$hasMethod && !$hasPayments) {
+            return 'Nichts zu aktualisieren: mindestens `status_id`, `referrer_id`, `payment_method_id` oder `payment`/`payments` angeben.';
         }
         if ($hasStatus && (float) $p['status_id'] <= 0) {
             return '`status_id` muss > 0 sein.';
         }
         if ($hasReferrer && (float) $p['referrer_id'] <= 0) {
             return '`referrer_id` muss > 0 sein.';
+        }
+        if ($hasMethod && (int) $p['payment_method_id'] <= 0) {
+            return '`payment_method_id` muss > 0 sein.';
         }
         foreach ($payments as $i => $pay) {
             if (!is_array($pay)) {
