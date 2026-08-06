@@ -188,6 +188,9 @@ class ExternalOrderController extends Controller
      * Teil-Update einer bestehenden Plenty-Order. Bewusst eng gehalten:
      *   - `status_id`            → setzt den Order-Status via updateOrder (partiell,
      *                              rührt Items/Adressen/Properties nicht an).
+     *   - `referrer_id`          → korrigiert die Herkunft (Top-Level `referrerId`),
+     *                              z. B. wenn eine Order mit falscher Herkunft
+     *                              angelegt wurde. Nur wenn explizit übergeben.
      *   - `payment` / `payments` → legt eine ODER mehrere Zahlungen an und verknüpft
      *                              sie mit der Order (gleiche Logik wie bei create()).
      *
@@ -244,6 +247,20 @@ class ExternalOrderController extends Controller
             } catch (\Throwable $e) {
                 return self::jsonError($response, $request, 'status_update_failed',
                     'Status-Update in Plenty fehlgeschlagen: ' . $e->getMessage(), 500);
+            }
+        }
+
+        // ---- 2b. Herkunft (referrerId) korrigieren -----------------------
+        if (isset($payload['referrer_id']) && $payload['referrer_id'] !== '') {
+            $newReferrer = (float) $payload['referrer_id'];
+            try {
+                $authHelper->processUnguarded(function () use ($orderRepository, $orderId, $newReferrer) {
+                    return $orderRepository->updateOrder(['referrerId' => $newReferrer], $orderId);
+                });
+                $applied['referrer_id'] = $newReferrer;
+            } catch (\Throwable $e) {
+                return self::jsonError($response, $request, 'referrer_update_failed',
+                    'Herkunfts-Update in Plenty fehlgeschlagen: ' . $e->getMessage(), 500);
             }
         }
 
@@ -350,21 +367,26 @@ class ExternalOrderController extends Controller
     }
 
     /**
-     * Validiert den Update-Payload (PUT). Mindestens eines von `status_id`
-     * oder `payment`/`payments` muss vorhanden sein — ein leeres Update wird
-     * abgelehnt, damit ein versehentlich leerer Body nicht still 200 liefert.
+     * Validiert den Update-Payload (PUT). Mindestens eines von `status_id`,
+     * `referrer_id` oder `payment`/`payments` muss vorhanden sein — ein leeres
+     * Update wird abgelehnt, damit ein versehentlich leerer Body nicht still
+     * 200 liefert.
      */
     private static function validateUpdatePayload(array $p): ?string
     {
         $hasStatus = isset($p['status_id']) && $p['status_id'] !== '';
+        $hasReferrer = isset($p['referrer_id']) && $p['referrer_id'] !== '';
         $payments  = self::normalizePaymentsInput($p);
         $hasPayments = !empty($payments);
 
-        if (!$hasStatus && !$hasPayments) {
-            return 'Nichts zu aktualisieren: mindestens `status_id` oder `payment`/`payments` angeben.';
+        if (!$hasStatus && !$hasReferrer && !$hasPayments) {
+            return 'Nichts zu aktualisieren: mindestens `status_id`, `referrer_id` oder `payment`/`payments` angeben.';
         }
         if ($hasStatus && (float) $p['status_id'] <= 0) {
             return '`status_id` muss > 0 sein.';
+        }
+        if ($hasReferrer && (float) $p['referrer_id'] <= 0) {
+            return '`referrer_id` muss > 0 sein.';
         }
         foreach ($payments as $i => $pay) {
             if (!is_array($pay)) {
