@@ -49,5 +49,12 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'article-list-4711/external/orders/{orderId}',
             'ArticleList4711\Controllers\ExternalOrderController@update'
         );
+
+        // Externer GET-Endpoint (read-only): Versanddaten einer Bestellung
+        // (Paketnummern + Frachtführer) — für die Versandmeldung an TikTok.
+        $apiRouter->get(
+            'article-list-4711/external/orders/{orderId}/shipping',
+            'ArticleList4711\Controllers\ExternalOrderController@shipping'
+        );
     }
 }

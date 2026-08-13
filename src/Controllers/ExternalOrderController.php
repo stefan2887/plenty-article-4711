@@ -318,6 +318,98 @@ class ExternalOrderController extends Controller
         return $response->json($result, 200);
     }
 
+    /**
+     * GET /rest/article-list-4711/external/orders/{orderId}/shipping
+     *
+     * Read-only: Versanddaten einer Bestellung — Paketnummern (Tracking) und
+     * Frachtführer/Versandprofil. Ändert NICHTS an der Order. Für die
+     * Versandmeldung an externe Marktplätze (z. B. TikTok).
+     */
+    public function shipping(
+        Request $request,
+        Response $response,
+        ConfigRepository $config,
+        OrderRepositoryContract $orderRepository,
+        \Plenty\Modules\Order\Shipping\Package\Contracts\OrderShippingPackageRepositoryContract $packageRepository,
+        \Plenty\Modules\Order\Shipping\ParcelService\Contracts\ParcelServicePresetRepositoryContract $presetRepository,
+        AuthHelper $authHelper,
+        int $orderId
+    ) {
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        $existing = self::findOrderById($authHelper, $orderRepository, $orderId);
+        if ($existing === null) {
+            return self::jsonError($response, $request, 'order_not_found',
+                "Order $orderId existiert nicht.", 404);
+        }
+
+        // Paketnummern (Trackingnummern) — best effort, read-only.
+        $packages = [];
+        try {
+            $list = $authHelper->processUnguarded(function () use ($packageRepository, $orderId) {
+                return $packageRepository->listOrderShippingPackages($orderId);
+            });
+            foreach ($list as $pkg) {
+                $packages[] = [
+                    'package_id'     => isset($pkg->id) ? (int) $pkg->id : null,
+                    'package_number' => isset($pkg->packageNumber) ? (string) $pkg->packageNumber : '',
+                ];
+            }
+        } catch (\Throwable $e) {
+            // Kein Paket-Repo-Zugriff → leere Liste, kein Fehler.
+        }
+
+        // Versandprofil (Order-Property typeId 2) + Frachtführer-Name.
+        $shippingProfileId = null;
+        foreach ($existing->properties as $prop) {
+            if ((int) $prop->typeId === self::PROP_SHIPPING_PROFILE) {
+                $shippingProfileId = (int) $prop->value;
+                break;
+            }
+        }
+        $parcelService = null;
+        if ($shippingProfileId) {
+            try {
+                $preset = $authHelper->processUnguarded(function () use ($presetRepository, $shippingProfileId) {
+                    return $presetRepository->getPresetById($shippingProfileId);
+                });
+                if ($preset) {
+                    $parcelService = [
+                        'preset_id'         => $shippingProfileId,
+                        'preset_name'       => isset($preset->backendName) ? (string) $preset->backendName : '',
+                        'parcel_service_id' => isset($preset->parcelServiceId) ? (int) $preset->parcelServiceId : null,
+                    ];
+                    // Name des Frachtführers, sofern die Relation geladen ist.
+                    try {
+                        if (isset($preset->parcelService)) {
+                            $ps = $preset->parcelService;
+                            $parcelService['name'] =
+                                isset($ps->backendName) && $ps->backendName !== ''
+                                    ? (string) $ps->backendName
+                                    : (isset($ps->name) ? (string) $ps->name : '');
+                        }
+                    } catch (\Throwable $e) {
+                        // Relation nicht verfügbar → preset_name reicht als Hinweis.
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Preset nicht lesbar → nur die Profil-ID zurückgeben.
+            }
+        }
+
+        return $response->json([
+            'order' => [
+                'plenty_order_id'     => $orderId,
+                'status_id'           => isset($existing->statusId) ? (float) $existing->statusId : null,
+                'shipping_profile_id' => $shippingProfileId,
+                'parcel_service'      => $parcelService,
+                'packages'            => $packages,
+            ],
+            'meta' => self::baseMeta($request),
+        ], 200);
+    }
+
     // ==================================================================
     // Validation
     // ==================================================================
