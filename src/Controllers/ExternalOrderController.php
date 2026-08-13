@@ -330,8 +330,6 @@ class ExternalOrderController extends Controller
         Response $response,
         ConfigRepository $config,
         OrderRepositoryContract $orderRepository,
-        \Plenty\Modules\Order\Shipping\Package\Contracts\OrderShippingPackageRepositoryContract $packageRepository,
-        \Plenty\Modules\Order\Shipping\ParcelService\Contracts\ParcelServicePresetRepositoryContract $presetRepository,
         AuthHelper $authHelper,
         int $orderId
     ) {
@@ -344,9 +342,14 @@ class ExternalOrderController extends Controller
                 "Order $orderId existiert nicht.", 404);
         }
 
-        // Paketnummern (Trackingnummern) — best effort, read-only.
+        // Paketnummern (Trackingnummern) — best effort, read-only. Die Repos
+        // werden bewusst zur Laufzeit aufgelöst (nicht per DI), damit ein in
+        // der Sandbox fehlender Contract nicht den ganzen Endpoint 500en lässt.
         $packages = [];
         try {
+            $packageRepository = pluginApp(
+                \Plenty\Modules\Order\Shipping\Package\Contracts\OrderShippingPackageRepositoryContract::class
+            );
             $list = $authHelper->processUnguarded(function () use ($packageRepository, $orderId) {
                 return $packageRepository->listOrderShippingPackages($orderId);
             });
@@ -371,6 +374,24 @@ class ExternalOrderController extends Controller
         $parcelService = null;
         if ($shippingProfileId) {
             try {
+                // Namespace variiert je Plenty-Version — beide Varianten probieren.
+                $presetRepository = null;
+                foreach ([
+                    'Plenty\\Modules\\Order\\Shipping\\Contracts\\ParcelServicePresetRepositoryContract',
+                    'Plenty\\Modules\\Order\\Shipping\\ParcelService\\Contracts\\ParcelServicePresetRepositoryContract',
+                ] as $cls) {
+                    try {
+                        if (interface_exists($cls) || class_exists($cls)) {
+                            $presetRepository = pluginApp($cls);
+                            break;
+                        }
+                    } catch (\Throwable $e) {
+                        // nächste Variante probieren
+                    }
+                }
+                if ($presetRepository === null) {
+                    throw new \RuntimeException('ParcelServicePresetRepository nicht verfügbar');
+                }
                 $preset = $authHelper->processUnguarded(function () use ($presetRepository, $shippingProfileId) {
                     return $presetRepository->getPresetById($shippingProfileId);
                 });
