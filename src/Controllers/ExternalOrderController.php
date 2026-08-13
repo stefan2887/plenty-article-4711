@@ -375,18 +375,18 @@ class ExternalOrderController extends Controller
         if ($shippingProfileId) {
             try {
                 // Namespace variiert je Plenty-Version — beide Varianten probieren.
+                // (interface_exists/class_exists sind in der Sandbox verboten,
+                // daher direkt pluginApp() im try/catch.)
                 $presetRepository = null;
                 foreach ([
                     'Plenty\\Modules\\Order\\Shipping\\Contracts\\ParcelServicePresetRepositoryContract',
                     'Plenty\\Modules\\Order\\Shipping\\ParcelService\\Contracts\\ParcelServicePresetRepositoryContract',
                 ] as $cls) {
                     try {
-                        if (interface_exists($cls) || class_exists($cls)) {
-                            $presetRepository = pluginApp($cls);
-                            break;
-                        }
+                        $presetRepository = pluginApp($cls);
+                        if ($presetRepository !== null) break;
                     } catch (\Throwable $e) {
-                        // nächste Variante probieren
+                        $presetRepository = null; // nächste Variante probieren
                     }
                 }
                 if ($presetRepository === null) {
