@@ -477,9 +477,17 @@ class ExternalOrderController extends Controller
                 ]);
                 return $orderRepository->searchOrders(1, 50);
             });
-            $entries = is_array($result) && isset($result['entries'])
-                ? $result['entries']
-                : (method_exists($result, 'getResult') ? $result->getResult() : []);
+            // (method_exists ist in der Sandbox verboten → try/catch-Kaskade)
+            $entries = [];
+            if (is_array($result) && isset($result['entries'])) {
+                $entries = $result['entries'];
+            } else {
+                try {
+                    $entries = $result->getResult();
+                } catch (\Throwable $e) {
+                    $entries = [];
+                }
+            }
             foreach ($entries as $entry) {
                 $creditNotes[] = self::serializeCreditNote($entry);
             }
