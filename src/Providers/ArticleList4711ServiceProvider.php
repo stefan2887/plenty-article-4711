@@ -56,5 +56,13 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'article-list-4711/external/orders/{orderId}/shipping',
             'ArticleList4711\Controllers\ExternalOrderController@shipping'
         );
+
+        // Externer GET-Endpoint (read-only): Gutschriften — ist {orderId}
+        // selbst eine Gutschrift, kommen deren Daten inkl. Ursprungsauftrag;
+        // sonst die Liste der Gutschriften zum Auftrag.
+        $apiRouter->get(
+            'article-list-4711/external/orders/{orderId}/credit-notes',
+            'ArticleList4711\Controllers\ExternalOrderController@creditNotes'
+        );
     }
 }

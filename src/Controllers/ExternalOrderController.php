@@ -431,6 +431,119 @@ class ExternalOrderController extends Controller
         ], 200);
     }
 
+    /**
+     * GET /rest/article-list-4711/external/orders/{orderId}/credit-notes
+     *
+     * Read-only: Gutschriften. Ist {orderId} selbst eine Gutschrift
+     * (typeId 4), werden deren Daten inkl. parent_order_id geliefert; sonst
+     * die Gutschriften, die auf {orderId} als Ursprungsauftrag verweisen.
+     * Ändert NICHTS.
+     */
+    public function creditNotes(
+        Request $request,
+        Response $response,
+        ConfigRepository $config,
+        OrderRepositoryContract $orderRepository,
+        AuthHelper $authHelper,
+        int $orderId
+    ) {
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        $order = self::findOrderById($authHelper, $orderRepository, $orderId);
+        if ($order === null) {
+            return self::jsonError($response, $request, 'order_not_found',
+                "Order $orderId existiert nicht.", 404);
+        }
+
+        if ((int) $order->typeId === 4) {
+            // {orderId} ist selbst eine Gutschrift
+            return $response->json([
+                'credit_note' => self::serializeCreditNote($order),
+                'meta'        => self::baseMeta($request),
+            ], 200);
+        }
+
+        // Gutschriften zum Ursprungsauftrag suchen (best effort — wenn der
+        // Filter in dieser Plenty-Version nicht greift, kommt eine leere
+        // Liste plus Hinweis; der Weg über die Gutschrift-ID geht immer).
+        $creditNotes = [];
+        $searchError = null;
+        try {
+            $result = $authHelper->processUnguarded(function () use ($orderRepository, $orderId) {
+                $orderRepository->setFilters([
+                    'parentOrderId' => $orderId,
+                    'orderTypes'    => [4],
+                ]);
+                return $orderRepository->searchOrders(1, 50);
+            });
+            $entries = is_array($result) && isset($result['entries'])
+                ? $result['entries']
+                : (method_exists($result, 'getResult') ? $result->getResult() : []);
+            foreach ($entries as $entry) {
+                $creditNotes[] = self::serializeCreditNote($entry);
+            }
+        } catch (\Throwable $e) {
+            $searchError = $e->getMessage();
+        }
+
+        return $response->json([
+            'order'        => ['plenty_order_id' => $orderId],
+            'credit_notes' => $creditNotes,
+            'search_error' => $searchError,
+            'meta'         => self::baseMeta($request),
+        ], 200);
+    }
+
+    /** Serialisiert eine Gutschrift (Order typeId 4) — alles best effort. */
+    private static function serializeCreditNote($order): array
+    {
+        $out = [
+            'plenty_order_id' => isset($order->id) ? (int) $order->id : (isset($order['id']) ? (int) $order['id'] : null),
+            'type_id'         => null,
+            'status_id'       => null,
+            'parent_order_id' => null,
+            'created_at'      => null,
+            'gross_total'     => null,
+            'currency'        => null,
+        ];
+        try { $out['type_id'] = (int) (is_array($order) ? $order['typeId'] : $order->typeId); } catch (\Throwable $e) {}
+        try { $out['status_id'] = (float) (is_array($order) ? $order['statusId'] : $order->statusId); } catch (\Throwable $e) {}
+        try { $out['created_at'] = (string) (is_array($order) ? ($order['createdAt'] ?? '') : $order->createdAt); } catch (\Throwable $e) {}
+
+        // Ursprungsauftrag: erst Property, dann orderReferences durchsuchen.
+        try {
+            $pid = is_array($order) ? ($order['parentOrderId'] ?? null) : $order->parentOrderId;
+            if ($pid) $out['parent_order_id'] = (int) $pid;
+        } catch (\Throwable $e) {}
+        if ($out['parent_order_id'] === null) {
+            try {
+                $refs = is_array($order) ? ($order['orderReferences'] ?? []) : $order->orderReferences;
+                foreach ($refs as $ref) {
+                    $refOrderId = is_array($ref) ? ($ref['originOrderId'] ?? $ref['referenceOrderId'] ?? null)
+                        : ($ref->originOrderId ?? $ref->referenceOrderId ?? null);
+                    if ($refOrderId) { $out['parent_order_id'] = (int) $refOrderId; break; }
+                }
+            } catch (\Throwable $e) {}
+        }
+
+        // Betrag: erste Amount-Zeile (Systemwährung).
+        try {
+            $amounts = is_array($order) ? ($order['amounts'] ?? []) : $order->amounts;
+            foreach ($amounts as $am) {
+                $gross = is_array($am) ? ($am['grossTotal'] ?? null) : $am->grossTotal;
+                $curr  = is_array($am) ? ($am['currency'] ?? null) : $am->currency;
+                if ($gross !== null) {
+                    $out['gross_total'] = (float) $gross;
+                    $out['currency']    = (string) $curr;
+                    break;
+                }
+            }
+        } catch (\Throwable $e) {}
+
+        return $out;
+    }
+
     // ==================================================================
     // Validation
     // ==================================================================
