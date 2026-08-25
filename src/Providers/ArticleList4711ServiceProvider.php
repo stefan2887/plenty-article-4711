@@ -57,6 +57,14 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'ArticleList4711\Controllers\ExternalOrderController@shipping'
         );
 
+        // Externer GET-Endpoint (read-only): Versanddaten per EXTERNER
+        // Auftragsnummer (z. B. TikTok-Order-ID) — für Tracking-Nachmeldung
+        // von Bestellungen, die ein anderes System importiert hat.
+        $apiRouter->get(
+            'article-list-4711/external/orders/by-external/{externalOrderId}/shipping',
+            'ArticleList4711\Controllers\ExternalOrderController@shippingByExternal'
+        );
+
         // Externer GET-Endpoint (read-only): Gutschriften — ist {orderId}
         // selbst eine Gutschrift, kommen deren Daten inkl. Ursprungsauftrag;
         // sonst die Liste der Gutschriften zum Auftrag.

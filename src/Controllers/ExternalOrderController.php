@@ -342,6 +342,55 @@ class ExternalOrderController extends Controller
                 "Order $orderId existiert nicht.", 404);
         }
 
+        return $response->json([
+            'order' => self::buildShippingInfo($authHelper, $existing, $orderId),
+            'meta'  => self::baseMeta($request),
+        ], 200);
+    }
+
+    /**
+     * GET /rest/article-list-4711/external/orders/by-external/{externalOrderId}/shipping
+     *
+     * Read-only: findet den Auftrag über die EXTERNE Auftragsnummer (z. B.
+     * TikTok-Order-ID, wie sie Importsysteme als external_order_id setzen)
+     * und liefert dieselben Versanddaten wie /shipping. Ändert NICHTS —
+     * gedacht für die Tracking-Nachmeldung von Alt-Bestellungen.
+     */
+    public function shippingByExternal(
+        Request $request,
+        Response $response,
+        ConfigRepository $config,
+        OrderRepositoryContract $orderRepository,
+        AuthHelper $authHelper,
+        string $externalOrderId
+    ) {
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        $existing = self::findExistingOrder($authHelper, $orderRepository, (string) $externalOrderId);
+        if ($existing === null) {
+            return self::jsonError($response, $request, 'order_not_found_by_external',
+                "Keine Order mit external_order_id $externalOrderId gefunden.", 404);
+        }
+        $orderId = (int) $existing->id;
+
+        $payload = self::buildShippingInfo($authHelper, $existing, $orderId);
+        $payload['external_order_id'] = (string) $externalOrderId;
+        return $response->json([
+            'order' => $payload,
+            'meta'  => self::baseMeta($request),
+        ], 200);
+    }
+
+    /**
+     * Baut die Versanddaten-Struktur (Pakete + Frachtführer) einer Order.
+     * Read-only, alles best effort — Repos zur Laufzeit aufgelöst.
+     */
+    private static function buildShippingInfo(
+        AuthHelper $authHelper,
+        $existing,
+        int $orderId
+    ): array {
         // Paketnummern (Trackingnummern) — best effort, read-only. Die Repos
         // werden bewusst zur Laufzeit aufgelöst (nicht per DI), damit ein in
         // der Sandbox fehlender Contract nicht den ganzen Endpoint 500en lässt.
@@ -419,16 +468,13 @@ class ExternalOrderController extends Controller
             }
         }
 
-        return $response->json([
-            'order' => [
-                'plenty_order_id'     => $orderId,
-                'status_id'           => isset($existing->statusId) ? (float) $existing->statusId : null,
-                'shipping_profile_id' => $shippingProfileId,
-                'parcel_service'      => $parcelService,
-                'packages'            => $packages,
-            ],
-            'meta' => self::baseMeta($request),
-        ], 200);
+        return [
+            'plenty_order_id'     => $orderId,
+            'status_id'           => isset($existing->statusId) ? (float) $existing->statusId : null,
+            'shipping_profile_id' => $shippingProfileId,
+            'parcel_service'      => $parcelService,
+            'packages'            => $packages,
+        ];
     }
 
     /**
