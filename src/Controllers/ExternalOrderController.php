@@ -795,6 +795,19 @@ class ExternalOrderController extends Controller
             'email'       => isset($a['email']) ? (string) $a['email'] : null,
         ];
 
+        // Plenty speichert Telefon/E-Mail an Adressen NUR über Address-Options
+        // (typeId 4 = Telefon, 5 = E-Mail) — flache Felder werden ignoriert.
+        $options = [];
+        if (!empty($a['phone'])) {
+            $options[] = ['typeId' => 4, 'value' => (string) $a['phone']];
+        }
+        if (!empty($a['email'])) {
+            $options[] = ['typeId' => 5, 'value' => (string) $a['email']];
+        }
+        if (!empty($options)) {
+            $data['options'] = $options;
+        }
+
         $created = $authHelper->processUnguarded(function () use ($addressRepository, $data) {
             return $addressRepository->createAddress($data);
         });
