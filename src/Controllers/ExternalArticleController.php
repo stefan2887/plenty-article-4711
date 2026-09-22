@@ -276,6 +276,11 @@ class ExternalArticleController extends Controller
                         try { $data = $s->toArray(); } catch (\Throwable $e) {
                             $data = json_decode(json_encode($s), true) ?: [];
                         }
+                        // Das Repository liefert teils Zeilen FREMDER
+                        // Variationen mit — strikt auf die angefragte filtern,
+                        // sonst entstehen falsche Bestands-Zuordnungen.
+                        $rowVid = isset($data['variationId']) ? (int) $data['variationId'] : 0;
+                        if ($rowVid !== 0 && $rowVid !== $variationId) continue;
                         $data['variation_id'] = $variationId;
                         $rows[] = $data;
                     }
