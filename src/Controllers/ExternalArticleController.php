@@ -270,13 +270,14 @@ class ExternalArticleController extends Controller
                         return $vsRepo->listStockByWarehouse($variationId, ['*']);
                     });
                     foreach ($list as $s) {
-                        $rows[] = [
-                            'variation_id'   => $variationId,
-                            'warehouse_id'   => self::asInt(self::prop($s, 'warehouseId')),
-                            'stock_net'      => self::asFloat(self::prop($s, 'stockNet')),
-                            'physical_stock' => self::asFloat(self::prop($s, 'stockPhysical')),
-                            'reserved_stock' => self::asFloat(self::prop($s, 'reservedStock')),
-                        ];
+                        // Modellfelder je Plenty-Version unterschiedlich →
+                        // roh durchreichen; der Konsument mappt tolerant.
+                        $data = [];
+                        try { $data = $s->toArray(); } catch (\Throwable $e) {
+                            $data = json_decode(json_encode($s), true) ?: [];
+                        }
+                        $data['variation_id'] = $variationId;
+                        $rows[] = $data;
                     }
                 } catch (\Throwable $e) {
                     if ($sourceError === null) $sourceError = $e->getMessage();
