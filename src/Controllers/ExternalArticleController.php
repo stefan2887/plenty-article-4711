@@ -259,29 +259,28 @@ class ExternalArticleController extends Controller
         $rows = [];
         $sourceError = null;
         try {
-            $stockRepo = pluginApp(
-                \Plenty\Modules\StockManagement\Stock\Contracts\StockRepositoryContract::class
+            // Klassischer Weg: Bestand je Lager pro Variation über das
+            // VariationStock-Repository (robust über Plenty-Versionen).
+            $vsRepo = pluginApp(
+                \Plenty\Modules\Item\VariationStock\Contracts\VariationStockRepositoryContract::class
             );
-            $result = $authHelper->processUnguarded(function () use ($stockRepo, $ids) {
-                $stockRepo->setFilters(['variationId' => $ids]);
-                return $stockRepo->listStock(
-                    ['variationId', 'warehouseId', 'stockNet', 'stockPhysical', 'reservedStock'],
-                    1,
-                    1000
-                );
-            });
-            $entries = [];
-            try { $entries = $result->getResult(); } catch (\Throwable $e) {
-                $entries = is_array($result) ? ($result['entries'] ?? $result) : [];
-            }
-            foreach ($entries as $s) {
-                $rows[] = [
-                    'variation_id'   => self::asInt(self::prop($s, 'variationId')),
-                    'warehouse_id'   => self::asInt(self::prop($s, 'warehouseId')),
-                    'stock_net'      => self::asFloat(self::prop($s, 'stockNet')),
-                    'physical_stock' => self::asFloat(self::prop($s, 'stockPhysical')),
-                    'reserved_stock' => self::asFloat(self::prop($s, 'reservedStock')),
-                ];
+            foreach ($ids as $variationId) {
+                try {
+                    $list = $authHelper->processUnguarded(function () use ($vsRepo, $variationId) {
+                        return $vsRepo->listStockByWarehouse($variationId, ['*']);
+                    });
+                    foreach ($list as $s) {
+                        $rows[] = [
+                            'variation_id'   => $variationId,
+                            'warehouse_id'   => self::asInt(self::prop($s, 'warehouseId')),
+                            'stock_net'      => self::asFloat(self::prop($s, 'stockNet')),
+                            'physical_stock' => self::asFloat(self::prop($s, 'stockPhysical')),
+                            'reserved_stock' => self::asFloat(self::prop($s, 'reservedStock')),
+                        ];
+                    }
+                } catch (\Throwable $e) {
+                    if ($sourceError === null) $sourceError = $e->getMessage();
+                }
             }
         } catch (\Throwable $e) {
             $sourceError = $e->getMessage();
