@@ -224,6 +224,76 @@ class ExternalArticleController extends Controller
         ], 200);
     }
 
+    /**
+     * GET /rest/article-list-4711/external/stocks?variation_ids=1,2,3
+     *
+     * Read-only: Bestand JE LAGER für die angegebenen Variations-IDs —
+     * direkt aus dem StockRepository (nicht aggregiert wie im Artikel-Export).
+     * Für den lagergenauen Bestands-Sync (z. B. nur Standardlager).
+     */
+    public function stocks(
+        Request $request,
+        Response $response,
+        ConfigRepository $config,
+        AuthHelper $authHelper
+    ) {
+        $authErr = self::requireValidApiKey($request, $response, $config);
+        if ($authErr !== null) return $authErr;
+
+        $idsParam = (string) $request->get('variation_ids', '');
+        $ids = [];
+        foreach (explode(',', $idsParam) as $part) {
+            $n = (int) trim($part);
+            if ($n > 0) $ids[] = $n;
+        }
+        if (empty($ids) || count($ids) > 200) {
+            return $response->json([
+                'error' => [
+                    'code'    => 'invalid_params',
+                    'message' => 'variation_ids: 1-200 kommagetrennte IDs erforderlich.',
+                ],
+                'meta' => self::baseMeta($request),
+            ], 400);
+        }
+
+        $rows = [];
+        $sourceError = null;
+        try {
+            $stockRepo = pluginApp(
+                \Plenty\Modules\StockManagement\Stock\Contracts\StockRepositoryContract::class
+            );
+            $result = $authHelper->processUnguarded(function () use ($stockRepo, $ids) {
+                $stockRepo->setFilters(['variationId' => $ids]);
+                return $stockRepo->listStock(
+                    ['variationId', 'warehouseId', 'stockNet', 'stockPhysical', 'reservedStock'],
+                    1,
+                    1000
+                );
+            });
+            $entries = [];
+            try { $entries = $result->getResult(); } catch (\Throwable $e) {
+                $entries = is_array($result) ? ($result['entries'] ?? $result) : [];
+            }
+            foreach ($entries as $s) {
+                $rows[] = [
+                    'variation_id'   => self::asInt(self::prop($s, 'variationId')),
+                    'warehouse_id'   => self::asInt(self::prop($s, 'warehouseId')),
+                    'stock_net'      => self::asFloat(self::prop($s, 'stockNet')),
+                    'physical_stock' => self::asFloat(self::prop($s, 'stockPhysical')),
+                    'reserved_stock' => self::asFloat(self::prop($s, 'reservedStock')),
+                ];
+            }
+        } catch (\Throwable $e) {
+            $sourceError = $e->getMessage();
+        }
+
+        return $response->json([
+            'stocks'       => $rows,
+            'source_error' => $sourceError,
+            'meta'         => self::baseMeta($request),
+        ], 200);
+    }
+
     private static function requireValidApiKey(Request $request, Response $response, ConfigRepository $config)
     {
         $expected = (string) $config->get('ArticleList4711.external_api_key', '');

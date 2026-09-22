@@ -38,6 +38,13 @@ class ArticleList4711ServiceProvider extends ServiceProvider
             'ArticleList4711\Controllers\ExternalArticleController@byMarking'
         );
 
+        // Externer GET-Endpoint (read-only): Bestand JE LAGER für eine Liste
+        // von Variations-IDs — für den lagergenauen Bestands-Sync.
+        $apiRouter->get(
+            'article-list-4711/external/stocks',
+            'ArticleList4711\Controllers\ExternalArticleController@stocks'
+        );
+
         // Externer POST-Endpoint zum Anlegen einer Plenty-Bestellung.
         $apiRouter->post(
             'article-list-4711/external/orders',
