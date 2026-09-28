@@ -621,11 +621,17 @@ class ExternalOrderController extends Controller
             if (!is_array($item)) {
                 return "items[$i] ist kein Objekt.";
             }
-            $isCoupon = isset($item['type']) && $item['type'] === 'coupon';
+            $isCoupon   = isset($item['type']) && $item['type'] === 'coupon';
+            $isShipping = isset($item['type']) && $item['type'] === 'shipping';
             if ($isCoupon) {
                 // Rabatt-Position: keine Variation nötig, Betrag muss < 0 sein.
                 if (!isset($item['unit_price']) || (float) $item['unit_price'] >= 0) {
                     return "items[$i] (coupon): unit_price muss negativ sein.";
+                }
+            } elseif ($isShipping) {
+                // Versandkosten-Position: keine Variation nötig, Betrag >= 0.
+                if (!isset($item['unit_price']) || (float) $item['unit_price'] < 0) {
+                    return "items[$i] (shipping): unit_price muss >= 0 sein.";
                 }
             } else {
                 $hasSalesItem = true;
@@ -641,7 +647,7 @@ class ExternalOrderController extends Controller
             }
         }
         if (!$hasSalesItem) {
-            return 'Mindestens eine Artikel-Position (ohne type=coupon) erforderlich.';
+            return 'Mindestens eine Artikel-Position (ohne type=coupon/shipping) erforderlich.';
         }
 
         if (empty($p['billing_address']) || !is_array($p['billing_address'])) {
@@ -883,6 +889,7 @@ class ExternalOrderController extends Controller
         $out = [];
         foreach ($items as $item) {
             $isCoupon    = isset($item['type']) && $item['type'] === 'coupon';
+            $isShipping  = isset($item['type']) && $item['type'] === 'shipping';
             $quantity    = (float) $item['quantity'];
             $unitPrice   = (float) $item['unit_price'];
             $vatRate     = isset($item['vat_rate'])      ? (float) $item['vat_rate']     : 19.0;
@@ -892,10 +899,13 @@ class ExternalOrderController extends Controller
 
             $row = [
                 // 1 = Variation/Sales position, 4 = Promotional Coupon
-                // (Rabatt-Position mit Negativbetrag — Plenty-Standard).
-                'typeId'         => $isCoupon ? 4 : 1,
+                // (Rabatt-Position mit Negativbetrag — Plenty-Standard),
+                // 6 = Shipping costs (Versandkosten-Position).
+                'typeId'         => $isCoupon ? 4 : ($isShipping ? 6 : 1),
                 'quantity'       => $quantity,
-                'orderItemName'  => $isCoupon && $name === '' ? 'Rabatt' : $name,
+                'orderItemName'  => $name !== ''
+                    ? $name
+                    : ($isCoupon ? 'Rabatt' : ($isShipping ? 'Versandkosten' : '')),
                 'countryVatId'   => $countryVatId,
                 'vatField'       => $vatField,
                 'vatRate'        => $vatRate,
@@ -907,7 +917,7 @@ class ExternalOrderController extends Controller
                     'priceOriginalGross' => $unitPrice,
                 ]],
             ];
-            if (!$isCoupon) {
+            if (!$isCoupon && !$isShipping) {
                 $row['itemVariationId'] = (int) $item['variation_id'];
             }
             $out[] = $row;
